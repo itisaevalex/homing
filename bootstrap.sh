@@ -80,6 +80,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4. install the migrate skill into ~/.claude/skills/ so any Claude Code
+#    session on this machine has the orchestrator playbook available.
+# ---------------------------------------------------------------------------
+SKILL_SRC="${REPO_ROOT}/skills/migrate/SKILL.md"
+SKILL_DEST_DIR="${HOME}/.claude/skills/migrate"
+if [ -f "$SKILL_SRC" ]; then
+  mkdir -p "$SKILL_DEST_DIR"
+  if [ ! -e "$SKILL_DEST_DIR/SKILL.md" ] || ! cmp -s "$SKILL_SRC" "$SKILL_DEST_DIR/SKILL.md"; then
+    cp "$SKILL_SRC" "$SKILL_DEST_DIR/SKILL.md"
+    echo "[4/4] migrate skill: installed to $SKILL_DEST_DIR"
+  else
+    echo "[4/4] migrate skill: already up to date at $SKILL_DEST_DIR"
+  fi
+else
+  echo "[4/4] migrate skill: source not found at $SKILL_SRC (skipping)"
+fi
+
+# ---------------------------------------------------------------------------
 # Verify
 # ---------------------------------------------------------------------------
 echo ""
@@ -87,8 +105,10 @@ echo "=== verify ==="
 chezmoi --version | head -1
 age --version
 python3 -c "import homing; print(f'homing v{homing.__version__} from {homing.__file__}')"
+[ -f "$SKILL_DEST_DIR/SKILL.md" ] && echo "migrate skill: $SKILL_DEST_DIR/SKILL.md"
 
 echo ""
 echo "=== done ==="
-echo "Next: read BOOTSTRAP.md, then ask the user which mode (A/B/C) they're in."
+echo "Next: in a fresh Claude Code session, the migrate skill will be auto-discovered."
+echo "Read BOOTSTRAP.md, then ask the user which mode (A/B/C) they're in."
 echo "PATH addition: export PATH=\"\$HOME/.local/bin:\$PATH\" if 'homing' isn't found in a new shell."
