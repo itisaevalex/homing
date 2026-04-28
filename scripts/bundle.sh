@@ -53,10 +53,34 @@ _cleanup_plain() {
 }
 trap _cleanup_plain EXIT INT TERM HUP
 if [ -d "$SECRETS_SRC" ]; then
-  echo "[2/5] secrets: tar + age-encrypt (you will be prompted for a passphrase)..."
-  # Create the plaintext tarball with mode 600 from the start.
-  ( umask 077 && tar czf "$SECRETS_PLAIN" -C "$HOME/.config" secrets/ )
-  "$AGE" --passphrase --output "$OUT/secrets.tar.gz.age" "$SECRETS_PLAIN"
+  # Exclude any stray bundle.key* files from the secrets tarball — these
+  # only appear when an earlier `bundle.sh ... BUNDLE_KEY_MODE=key` run
+  # leaked an identity file into ~/.config/secrets/. They're harmless to
+  # destination but messy and would be re-bundled on every run.
+  ( umask 077 && tar czf "$SECRETS_PLAIN" \
+      --exclude='bundle.key' --exclude='bundle.key.*' \
+      -C "$HOME/.config" secrets/ )
+  AGE_KEYGEN=${AGE_KEYGEN:-$HOME/.local/bin/age-keygen}
+  if [ "${BUNDLE_KEY_MODE:-passphrase}" = "key" ]; then
+    # Non-interactive: generate an ephemeral keypair, encrypt with recipient
+    # pubkey, ship the identity file as bundle.key alongside the bundle.
+    # Suitable for trusted-channel transfers (e.g. point-to-point USB that
+    # will be wiped). Carry bundle.key on a SEPARATE device or wipe with the
+    # bundle once verified on destination.
+    echo "[2/5] secrets: tar + age-encrypt (key mode — generating ephemeral keypair)..."
+    KEYFILE="$OUT/bundle.key"
+    ( umask 077 && "$AGE_KEYGEN" -o "$KEYFILE" 2>/dev/null )
+    PUBKEY=$(grep '^# public key:' "$KEYFILE" | awk '{print $NF}')
+    if [ -z "$PUBKEY" ]; then
+      echo "error: failed to extract public key from $KEYFILE" >&2
+      exit 1
+    fi
+    "$AGE" -r "$PUBKEY" --output "$OUT/secrets.tar.gz.age" "$SECRETS_PLAIN"
+    chmod 600 "$KEYFILE"
+  else
+    echo "[2/5] secrets: tar + age-encrypt (you will be prompted for a passphrase)..."
+    "$AGE" --passphrase --output "$OUT/secrets.tar.gz.age" "$SECRETS_PLAIN"
+  fi
   _cleanup_plain
 else
   echo "[2/5] no $SECRETS_SRC — skipping secrets"
@@ -120,9 +144,16 @@ if command -v chezmoi >/dev/null; then
   chezmoi init --apply=false 2>/dev/null || true
 fi
 
-# 3. Decrypt secrets (will prompt for passphrase)
+# 3. Decrypt secrets — uses bundle.key if present (key mode), else prompts for
+#    the passphrase used at bundle time.
 if [ -f "$HERE/secrets.tar.gz.age" ]; then
-  echo "[3/5] decrypting secrets (you will be prompted for the bundle passphrase)..."
+  if [ -f "$HERE/bundle.key" ]; then
+    echo "[3/5] decrypting secrets using bundle.key..."
+    AGE_DECRYPT_ARGS=(-d -i "$HERE/bundle.key")
+  else
+    echo "[3/5] decrypting secrets (you will be prompted for the bundle passphrase)..."
+    AGE_DECRYPT_ARGS=(-d)
+  fi
   # Per-user tmp so a multi-user box doesn't expose plaintext on /tmp.
   SECRETS_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/migrate-secrets.XXXXXX")
   chmod 700 "$SECRETS_TMPDIR"
@@ -134,7 +165,7 @@ if [ -f "$HERE/secrets.tar.gz.age" ]; then
     rm -rf "$SECRETS_TMPDIR" 2>/dev/null || true
   }
   trap _cleanup_secrets EXIT INT TERM HUP
-  ( umask 077 && age -d -o "$SECRETS_PLAIN" "$HERE/secrets.tar.gz.age" )
+  ( umask 077 && age "${AGE_DECRYPT_ARGS[@]}" -o "$SECRETS_PLAIN" "$HERE/secrets.tar.gz.age" )
   mkdir -p "$HOME/.config"
   tar xzf "$SECRETS_PLAIN" -C "$HOME/.config/"
   _cleanup_secrets
@@ -173,7 +204,7 @@ cat <<EOF
 
 Next steps you do manually:
   1. Open a fresh shell so ~/.bashrc + secrets load.
-  2. Verify env vars: env | grep -E 'API_KEY|SECRET|TOKEN'  # adjust pattern to match your own service names
+  2. Verify env vars: env | grep -E 'STRIPE|SUPABASE|RESEND|FIRECRAWL'
   3. Restore SSH/GPG/AWS keys via your separate channel — they are NOT in this bundle.
   4. tailscale up --auth-key=<from your password manager>
   5. gh auth login (browser flow)
@@ -231,7 +262,7 @@ You'll be prompted once for the age passphrase that encrypted the secrets.
 - AWS credentials — re-enter via 'aws configure' on target
 - Browser profiles — use Firefox Sync / Chrome sync if you want them
 - Project source — clone fresh from GitHub
-- External agent/memory data — if you use a personal memory service, point the new machine at it directly
+- Honcho data — already lives on the home server, just point at it from the new machine
 
 ## Threat model
 
