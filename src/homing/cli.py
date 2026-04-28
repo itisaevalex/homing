@@ -24,6 +24,7 @@ from homing import orchestrator as orchestrator_module
 from homing import platform as platform_module
 from homing import summary as summary_module
 from homing.worklist import Worklist
+from homing.draft_cli import register_draft_command
 
 app = typer.Typer(
     name="homing",
@@ -230,14 +231,10 @@ def classify() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase E — draft (stub)
+# Phase E — draft (wired from draft_cli)
 # ---------------------------------------------------------------------------
 
-
-@app.command(help="Phase E: draft AGENT.md / PLACE.md for a unit (stub).")
-def draft(name: str = typer.Argument(..., help="Unit name.")) -> None:
-    del name
-    _stub("draft")
+register_draft_command(app)
 
 
 # ---------------------------------------------------------------------------
