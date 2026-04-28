@@ -87,6 +87,51 @@ else
 fi
 trap - EXIT INT TERM HUP
 
+# 2b. credentials bundle — opt-in via INCLUDE_CREDS=1.
+# By default these live out-of-band per BOOTSTRAP.md. Setting INCLUDE_CREDS=1
+# adds a creds.tar.gz.age (encrypted with the same recipient as secrets) so
+# trusted-channel transfers can ship everything in one bundle. SSH keys, AWS
+# credentials, gh tokens, and gpg keyring (public material only) — no Docker
+# buildx cache (regenerable) and no Tailscale state (system-level + re-auth).
+if [ "${INCLUDE_CREDS:-0}" = "1" ]; then
+  CREDS_PLAIN="$OUT/.creds-plain.tar.gz"
+  _cleanup_creds_plain() {
+    if [ -f "$CREDS_PLAIN" ]; then
+      shred -u "$CREDS_PLAIN" 2>/dev/null || rm -f "$CREDS_PLAIN"
+    fi
+  }
+  trap _cleanup_creds_plain EXIT INT TERM HUP
+
+  CREDS_PATHS=()
+  [ -d "$HOME/.ssh" ] && CREDS_PATHS+=(.ssh)
+  [ -d "$HOME/.gnupg" ] && CREDS_PATHS+=(.gnupg)
+  [ -d "$HOME/.aws" ] && CREDS_PATHS+=(.aws)
+  [ -d "$HOME/.config/gh" ] && CREDS_PATHS+=(.config/gh)
+  [ -f "$HOME/.docker/config.json" ] && CREDS_PATHS+=(.docker/config.json)
+
+  if [ ${#CREDS_PATHS[@]} -gt 0 ]; then
+    echo "[2b] creds: tar + age-encrypt (${CREDS_PATHS[*]})..."
+    ( umask 077 && tar czf "$CREDS_PLAIN" -C "$HOME" "${CREDS_PATHS[@]}" )
+    if [ "${BUNDLE_KEY_MODE:-passphrase}" = "key" ]; then
+      # Reuse the same bundle.key generated for secrets
+      KEYFILE="$OUT/bundle.key"
+      if [ ! -f "$KEYFILE" ]; then
+        echo "error: BUNDLE_KEY_MODE=key but $KEYFILE missing" >&2
+        exit 1
+      fi
+      PUBKEY=$(grep '^# public key:' "$KEYFILE" | awk '{print $NF}')
+      "$AGE" -r "$PUBKEY" --output "$OUT/creds.tar.gz.age" "$CREDS_PLAIN"
+    else
+      echo "  (you will be prompted for the same passphrase used for secrets)"
+      "$AGE" --passphrase --output "$OUT/creds.tar.gz.age" "$CREDS_PLAIN"
+    fi
+    _cleanup_creds_plain
+  else
+    echo "[2b] INCLUDE_CREDS=1 but none of .ssh/.gnupg/.aws/.config/gh/.docker found — skipping"
+  fi
+  trap - EXIT INT TERM HUP
+fi
+
 # 3. homing system output (optional — only if it exists)
 if [ -d "$HOME/system" ]; then
   echo "[3/5] homing ~/system/ snapshot..."
@@ -181,6 +226,36 @@ else
   echo "[3/5] no secrets.tar.gz.age in bundle — skipping secrets"
 fi
 
+# 3b. Decrypt + extract creds bundle if shipped (opt-in via INCLUDE_CREDS=1
+#     at bundle time). Restores .ssh/.gnupg/.aws/.config/gh/.docker/config.json.
+if [ -f "$HERE/creds.tar.gz.age" ]; then
+  echo "[3b] decrypting + extracting creds bundle..."
+  CREDS_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/migrate-creds.XXXXXX")
+  chmod 700 "$CREDS_TMPDIR"
+  CREDS_PLAIN="$CREDS_TMPDIR/creds-plain.tar.gz"
+  _cleanup_creds() {
+    if [ -f "$CREDS_PLAIN" ]; then
+      shred -u "$CREDS_PLAIN" 2>/dev/null || rm -f "$CREDS_PLAIN"
+    fi
+    rm -rf "$CREDS_TMPDIR" 2>/dev/null || true
+  }
+  trap _cleanup_creds EXIT INT TERM HUP
+  ( umask 077 && age "${AGE_DECRYPT_ARGS[@]}" -o "$CREDS_PLAIN" "$HERE/creds.tar.gz.age" )
+  tar xzf "$CREDS_PLAIN" -C "$HOME/"
+  _cleanup_creds
+  trap - EXIT INT TERM HUP
+  # Lock down credential dirs — tar may have preserved modes but be defensive.
+  for d in "$HOME/.ssh" "$HOME/.gnupg" "$HOME/.aws" "$HOME/.config/gh"; do
+    if [ -d "$d" ]; then
+      chmod 700 "$d"
+      find "$d" -type d -exec chmod 700 {} +
+      find "$d" -type f -exec chmod 600 {} +
+    fi
+  done
+  # Public-key files conventionally stay world-readable; restore that for .pub
+  find "$HOME/.ssh" -name '*.pub' -type f -exec chmod 644 {} + 2>/dev/null || true
+fi
+
 # 4. Restore homing's system/ output if present
 if [ -f "$HERE/system.tar.gz" ]; then
   echo "[4/5] restoring ~/system/ ..."
@@ -205,13 +280,19 @@ cat <<EOF
 Next steps you do manually:
   1. Open a fresh shell so ~/.bashrc + secrets load.
   2. Verify env vars: env | grep -E 'STRIPE|SUPABASE|RESEND|FIRECRAWL'
-  3. Restore SSH/GPG/AWS keys via your separate channel — they are NOT in this bundle.
+  3. If creds were NOT included in this bundle, restore SSH/GPG/AWS via your
+     separate channel. If they WERE included (creds.tar.gz.age present), they
+     are now extracted to ~/.ssh, ~/.gnupg, ~/.aws — verify with:
+        ssh -T git@github.com
+        aws sts get-caller-identity
   4. tailscale up --auth-key=<from your password manager>
-  5. gh auth login (browser flow)
+  5. gh auth status   (if creds bundled, token is already restored)
 
 What this bundle did NOT migrate, by design:
-  - SSH/GPG private keys (separate encrypted channel)
-  - AWS credentials (~/.aws/credentials)
+  - Tailscale state (system-level; re-auth is the canonical path)
+  - Docker buildx cache (regenerable)
+  - Browser saved passwords (use Firefox Sync / Chrome sync)
+  - Project source code (clone fresh from GitHub)
   - Browser bookmarks/passwords (use Firefox Sync / Chrome sync)
   - Project source code (clone from GitHub fresh)
 
