@@ -1,20 +1,29 @@
 """Typer-based ``homing`` CLI.
 
-This module wires the eight phase commands. Most are stubs at this stage; only
-``summary`` is fully implemented (Phase B), since it has no LLM dependency and
-serves as the first usable artifact.
+Wires the eight phase commands onto the modules that implement them. Phases
+A (enumerate), B (summary), C (rules), and G (index) are operational; the
+intervening LLM-touching phases are still stubs and exit with code 1 when
+invoked, so users see a clear error rather than silent no-ops.
 """
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from homing import __version__
+from homing import enumerate as enumerate_module
+from homing import index as index_module
+from homing import orchestrator as orchestrator_module
+from homing import platform as platform_module
 from homing import summary as summary_module
+from homing.worklist import Worklist
 
 app = typer.Typer(
     name="homing",
@@ -24,11 +33,14 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
     add_completion=False,
+    invoke_without_command=True,
 )
 
 _console = Console()
 _DEFAULT_SYSTEM_DIR = Path.home() / "system"
 _DEFAULT_HOME = Path.home()
+_STALE_DAYS = 90
+_SECONDS_PER_DAY = 86400
 
 
 def _stub(name: str) -> None:
@@ -38,6 +50,7 @@ def _stub(name: str) -> None:
 
 @app.callback()
 def _root(
+    ctx: typer.Context,
     version: bool = typer.Option(
         False,
         "--version",
@@ -48,28 +61,93 @@ def _root(
     if version:
         typer.echo(f"homing {__version__}")
         raise typer.Exit()
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit()
 
 
 # ---------------------------------------------------------------------------
-# Phase A — enumerate (stub)
+# Phase A — enumerate
 # ---------------------------------------------------------------------------
 
 
-@app.command(help="Phase A: deterministic two-pass walk of $HOME (stub).")
+@app.command(help="Phase A: deterministic two-pass walk of $HOME.")
 def enumerate(
-    config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to platform config YAML override."
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="Output directory. Defaults to ~/system."
     ),
-    output: Optional[Path] = typer.Option(
-        None, "--output", help="Output directory for enumeration.json (defaults to ~/system)."
+    home: Path = typer.Option(
+        _DEFAULT_HOME, "--home", help="Source directory to walk. Defaults to $HOME."
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help="Override the platform config YAML. Defaults to the bundled per-platform file.",
     ),
 ) -> None:
-    del config, output
-    _stub("enumerate")
+    system_dir = system_dir.resolve()
+    home = home.resolve()
+    system_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = _load_config(config)
+
+    worklist = Worklist(system_dir / "worklist.sqlite")
+    run_id = worklist.start_run("enumerate")
+    try:
+        result = enumerate_module.enumerate_home(home, cfg)
+        out_path = system_dir / "enumeration.json"
+        out_path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        for project in result["projects"]:
+            _upsert_unit(
+                worklist,
+                kind="project",
+                name=_unit_name_from_path(project["path"], home),
+                path=project["path"],
+                payload={
+                    "signals_found": project.get("signals_found", []),
+                    "size_bytes": project.get("size_bytes", 0),
+                    "last_mtime": project.get("last_mtime", 0.0),
+                },
+            )
+        for place in result["places"]:
+            _upsert_unit(
+                worklist,
+                kind="place",
+                name=_unit_name_from_path(place["path"], home),
+                path=place["path"],
+                payload={
+                    "category": place.get("category"),
+                    "size_bytes": place.get("size_bytes", 0),
+                    "last_mtime": place.get("last_mtime", 0.0),
+                },
+            )
+
+        summary_msg = (
+            f"found {len(result['projects'])} projects, "
+            f"{len(result['places'])} places, "
+            f"{len(result['errors'])} errors"
+        )
+        worklist.end_run(run_id, exit_code=0, summary=summary_msg)
+    finally:
+        worklist.close()
+
+    table = Table(title="enumerate", show_header=True, header_style="bold")
+    table.add_column("kind")
+    table.add_column("count", justify="right")
+    table.add_row("projects", str(len(result["projects"])))
+    table.add_row("places", str(len(result["places"])))
+    table.add_row("skipped", str(len(result["skipped"])))
+    table.add_row("errors", str(len(result["errors"])))
+    _console.print(table)
+    _console.print(f"[green]wrote[/] {out_path}")
 
 
 # ---------------------------------------------------------------------------
-# Phase B — summary (implemented)
+# Phase B — summary
 # ---------------------------------------------------------------------------
 
 
@@ -91,13 +169,54 @@ def summary(
 
 
 # ---------------------------------------------------------------------------
-# Phase C — rules (stub)
+# Phase C — rules
 # ---------------------------------------------------------------------------
 
 
-@app.command(help="Phase C: run deterministic rule plugins over enumerated units (stub).")
-def rules() -> None:
-    _stub("rules")
+@app.command(help="Phase C: run deterministic rule plugins over enumerated units.")
+def rules(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory. Defaults to ~/system."
+    ),
+) -> None:
+    system_dir = system_dir.resolve()
+    db_path = system_dir / "worklist.sqlite"
+    if not db_path.is_file():
+        _console.print(
+            f"[red]error:[/] no worklist at {db_path}. "
+            "Run 'homing enumerate' first to populate it."
+        )
+        raise typer.Exit(code=2)
+
+    worklist = Worklist(db_path)
+    run_id = worklist.start_run("rules")
+    try:
+        report = orchestrator_module.run_rules(worklist)
+        summary_msg = (
+            f"{report.units_evaluated} units evaluated, "
+            f"{report.units_needing_llm} need LLM, "
+            f"{report.total_findings} findings persisted"
+        )
+        worklist.end_run(run_id, exit_code=0, summary=summary_msg)
+    finally:
+        worklist.close()
+
+    table = Table(title="rules", show_header=True, header_style="bold")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    table.add_row("units considered", str(report.total_units))
+    table.add_row("evaluated (>= 0.7 confidence)", str(report.units_evaluated))
+    table.add_row("needs-llm", str(report.units_needing_llm))
+    table.add_row("findings persisted", str(report.total_findings))
+    _console.print(table)
+
+    if report.by_rule_counts:
+        per_rule = Table(title="findings by rule", show_header=True, header_style="bold")
+        per_rule.add_column("rule")
+        per_rule.add_column("fired", justify="right")
+        for name, count in report.by_rule_counts.items():
+            per_rule.add_row(name, str(count))
+        _console.print(per_rule)
 
 
 # ---------------------------------------------------------------------------
@@ -133,43 +252,188 @@ def validate(name: str = typer.Argument(..., help="Unit name.")) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Phase G — index (stub)
+# Phase G — index
 # ---------------------------------------------------------------------------
 
 
-@app.command(help="Phase G: aggregate manifests into index.json (stub).")
-def index() -> None:
-    _stub("index")
+@app.command(help="Phase G: aggregate manifests into index.json.")
+def index(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory. Defaults to ~/system."
+    ),
+) -> None:
+    system_dir = system_dir.resolve()
+    system_dir.mkdir(parents=True, exist_ok=True)
+    db_path = system_dir / "worklist.sqlite"
+
+    worklist: Optional[Worklist] = None
+    if db_path.is_file():
+        worklist = Worklist(db_path)
+        run_id = worklist.start_run("index")
+    else:
+        run_id = None
+
+    try:
+        payload = index_module.build_index(worklist, system_dir)
+        out_path = system_dir / "index.json"
+        out_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        if worklist is not None and run_id is not None:
+            worklist.end_run(
+                run_id,
+                exit_code=0,
+                summary=(
+                    f"{payload['project_count']} projects, "
+                    f"{payload['place_count']} places, "
+                    f"{len(payload['warnings'])} warnings"
+                ),
+            )
+    finally:
+        if worklist is not None:
+            worklist.close()
+
+    table = Table(title="index", show_header=True, header_style="bold")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    table.add_row("projects", str(payload["project_count"]))
+    table.add_row("places", str(payload["place_count"]))
+    table.add_row("warnings", str(len(payload["warnings"])))
+    _console.print(table)
+
+    if payload["warnings"]:
+        _console.print("[yellow]warnings:[/]")
+        for w in payload["warnings"]:
+            _console.print(f"  - {w}")
+    _console.print(f"[green]wrote[/] {out_path}")
 
 
 # ---------------------------------------------------------------------------
-# query (stub group)
+# query
 # ---------------------------------------------------------------------------
 
 
-query_app = typer.Typer(help="Query the aggregated manifest index (stub).")
+query_app = typer.Typer(help="Query the aggregated manifest index.")
 app.add_typer(query_app, name="query")
 
 
-@query_app.command("list", help="List units (stub).")
-def query_list() -> None:
-    _stub("query list")
+def _load_index(system_dir: Path) -> dict[str, Any]:
+    path = system_dir.resolve() / "index.json"
+    if not path.is_file():
+        _console.print(
+            f"[red]error:[/] no index.json at {path}. Run 'homing index' first."
+        )
+        raise typer.Exit(code=2)
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
-@query_app.command("show", help="Show a single unit (stub).")
-def query_show(name: str = typer.Argument(..., help="Unit name.")) -> None:
-    del name
-    _stub("query show")
+def _all_units(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return list(payload.get("projects", [])) + list(payload.get("places", []))
 
 
-@query_app.command("stale", help="List stale units (stub).")
-def query_stale() -> None:
-    _stub("query stale")
+@query_app.command("list", help="List every unit currently in the index.")
+def query_list(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory. Defaults to ~/system."
+    ),
+) -> None:
+    payload = _load_index(system_dir)
+    table = Table(title="units", show_header=True, header_style="bold")
+    table.add_column("name")
+    table.add_column("kind")
+    table.add_column("state")
+    table.add_column("purpose")
+    table.add_column("last_meaningful_activity")
+
+    units = _all_units(payload)
+    units.sort(key=lambda u: (u.get("kind", ""), u.get("name", "")))
+    for u in units:
+        table.add_row(
+            str(u.get("name", "")),
+            str(u.get("kind", "")),
+            str(u.get("state", u.get("status", ""))),
+            str(u.get("purpose", "")),
+            str(u.get("last_meaningful_activity", "")),
+        )
+    _console.print(table)
+    _console.print(f"[dim]{len(units)} unit(s)[/]")
 
 
-@query_app.command("active", help="List active units (stub).")
-def query_active() -> None:
-    _stub("query active")
+@query_app.command("show", help="Show a single unit as JSON.")
+def query_show(
+    name: str = typer.Argument(..., help="Unit name."),
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory. Defaults to ~/system."
+    ),
+) -> None:
+    payload = _load_index(system_dir)
+    for u in _all_units(payload):
+        if u.get("name") == name:
+            _console.print_json(json.dumps(u, sort_keys=True))
+            agent_path = u.get("agent_md_path") or u.get("place_md_path")
+            if agent_path:
+                _console.print(f"[green]manifest:[/] {agent_path}")
+            return
+    _console.print(f"[red]error:[/] no unit named {name!r} in index")
+    raise typer.Exit(code=2)
+
+
+@query_app.command("stale", help="List units with no meaningful activity in the last 90 days.")
+def query_stale(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory. Defaults to ~/system."
+    ),
+) -> None:
+    payload = _load_index(system_dir)
+    cutoff = datetime.now(timezone.utc).timestamp() - (_STALE_DAYS * _SECONDS_PER_DAY)
+
+    table = Table(title=f"stale units (>{_STALE_DAYS} days)", show_header=True, header_style="bold")
+    table.add_column("name")
+    table.add_column("kind")
+    table.add_column("last_meaningful_activity")
+
+    stale = []
+    for u in _all_units(payload):
+        last = u.get("last_meaningful_activity")
+        ts = _to_epoch(last)
+        if ts is None or ts < cutoff:
+            stale.append(u)
+    stale.sort(key=lambda u: (str(u.get("last_meaningful_activity", "")), str(u.get("name", ""))))
+
+    for u in stale:
+        table.add_row(
+            str(u.get("name", "")),
+            str(u.get("kind", "")),
+            str(u.get("last_meaningful_activity", "(unknown)")),
+        )
+    _console.print(table)
+    _console.print(f"[dim]{len(stale)} stale unit(s)[/]")
+
+
+@query_app.command("active", help="List units whose state is 'active'.")
+def query_active(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory. Defaults to ~/system."
+    ),
+) -> None:
+    payload = _load_index(system_dir)
+    table = Table(title="active units", show_header=True, header_style="bold")
+    table.add_column("name")
+    table.add_column("kind")
+    table.add_column("purpose")
+
+    active = [u for u in _all_units(payload) if str(u.get("state", "")).lower() == "active"]
+    active.sort(key=lambda u: str(u.get("name", "")))
+    for u in active:
+        table.add_row(
+            str(u.get("name", "")),
+            str(u.get("kind", "")),
+            str(u.get("purpose", "")),
+        )
+    _console.print(table)
+    _console.print(f"[dim]{len(active)} active unit(s)[/]")
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +445,68 @@ def query_active() -> None:
 def reconcile(name: str = typer.Argument(..., help="Unit name.")) -> None:
     del name
     _stub("reconcile")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _load_config(override: Optional[Path]) -> dict[str, Any]:
+    if override is not None:
+        import yaml
+
+        with override.open("r", encoding="utf-8") as fh:
+            loaded = yaml.safe_load(fh) or {}
+        if not isinstance(loaded, dict):
+            raise typer.BadParameter(f"config at {override} is not a YAML mapping")
+        return loaded
+    return platform_module.load_config(platform_module.detect())
+
+
+def _unit_name_from_path(path: str, home: Path) -> str:
+    """Stable, unique-ish name for a unit derived from its absolute path.
+
+    Uses the path relative to ``home`` with separators replaced by ``__`` so
+    duplicate basenames in different parents don't collide. Falls back to
+    the absolute path if the unit lives outside ``home``.
+    """
+    p = Path(path)
+    try:
+        rel = p.relative_to(home)
+    except ValueError:
+        # Not under home; flatten the absolute path.
+        return str(p).replace("/", "__").lstrip("_") or p.name
+    rel_str = rel.as_posix().replace("/", "__")
+    return rel_str or p.name
+
+
+def _upsert_unit(
+    worklist: Worklist, *, kind: str, name: str, path: str, payload: dict[str, Any]
+) -> None:
+    """Insert a unit, ignoring duplicates so re-runs are idempotent."""
+    if worklist.unit(name) is not None:
+        # Already present; we leave its status alone (later phases own it)
+        # but refresh the payload so re-enumeration captures fresh signals.
+        # The worklist API doesn't expose an update_payload helper; instead
+        # we record an event so the change is auditable.
+        worklist.event(name, type="info", message="re-enumerated; payload unchanged in DB")
+        return
+    worklist.add_unit(kind=kind, name=name, path=path, payload=payload)
+
+
+def _to_epoch(value: Any) -> Optional[float]:
+    """Best-effort conversion of an ISO timestamp / numeric value to epoch seconds."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 if __name__ == "__main__":  # pragma: no cover
