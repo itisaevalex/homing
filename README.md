@@ -1,10 +1,28 @@
 # homing
 
-> An agent that makes your laptop legible to other agents.
+> An agent harness for laptop migration and legibility.
 
-`homing` walks your `$HOME`, classifies what it finds, and produces a parallel structured representation that any agent (Claude Code, Hermes, whatever) can read to understand your machine in seconds — without re-discovering the layout, the active projects, the dead ones, or the conventions you use.
+`homing` is two things at once:
 
-The tool is portable across Linux, macOS, Windows. The output is per-machine.
+1. **A tool.** Walks `$HOME`, classifies what it finds, and produces a parallel structured representation that any agent can read to understand the machine in seconds.
+2. **A harness.** The repo itself is meant to be cloned on a machine, opened in Claude Code (or similar), and the agent reads `BOOTSTRAP.md` to figure out what the user wants — generate a migration bundle, apply one, or just map the current laptop.
+
+The tool is portable across Linux, macOS, Windows. The output is per-machine. The bundle is physical-transfer only (USB stick, age-encrypted secrets) by design — nothing about your personal config layer goes through a network.
+
+## Quickstart for the agent harness use case
+
+```bash
+# on any machine — old or new
+git clone git@github.com:itisaevalex/homing.git
+cd homing
+claude    # start your agent here
+```
+
+The agent's first move should be to read `BOOTSTRAP.md` and ask which mode you're in:
+
+- **A — Leaving** this machine: generate a bundle to take to the next one.
+- **B — Arriving** at this machine: apply a bundle that's on a USB.
+- **C — Just exploring**: map the current laptop, no migration.
 
 ## Why
 

@@ -1,6 +1,10 @@
 # CLAUDE.md — homing
 
-Agent contract for working on the `homing` repository.
+Agent contract for **working on the `homing` repository itself** — i.e. you are an agent helping the user develop, test, or change `homing`'s code.
+
+> **If you are an agent running migration work for a user (clone + claude pattern), this is not your file. Read [BOOTSTRAP.md](./BOOTSTRAP.md) instead.** That doc walks through the three modes (leaving / arriving / exploring) and tells you what to do.
+
+The rest of this file is about contributing to the codebase.
 
 ## What this repo is
 
