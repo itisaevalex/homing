@@ -65,7 +65,7 @@ classes:
     description: A folder consisting almost entirely of screenshots — Pictures/Screenshots, Desktop dumps.
     migrate_strategy: archive
     typical_signals:
-      - >=85% .png files
+      - ">=85% .png files"
       - parent folder name matches /screenshot/i
       - filenames match Screenshot from / Screen Shot / CleanShot patterns
     sensitive: false
@@ -222,4 +222,18 @@ classes:
     typical_signals:
       - mixed extensions with no dominant pattern
       - no filename or content signal matched a known class
+    sensitive: false
+
+  - id: needs-human
+    description: |
+      Classifier is genuinely unsure. Use this when no taxonomy class fits
+      with confidence >= 0.5, or when the content looks ambiguous, mixed, or
+      potentially sensitive. Distinct from 'unknown' (which means "no signal
+      matched"); 'needs-human' means "I won't guess, please decide."
+    migrate_strategy: review
+    typical_signals:
+      - mixed content with no dominant pattern AND folder name is suggestive but ambiguous
+      - sensitive-looking but unclear classification (could be tax, contract, or correspondence)
+      - small folder (< 5 files) where sampling didn't land on representative content
+      - content read but no strong signal pointed at a single class
     sensitive: false
