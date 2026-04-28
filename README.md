@@ -1,11 +1,13 @@
 # homing
 
-> An agent harness for laptop migration and legibility.
+> An agent harness for laptop migration, dev-environment legibility, and personal-document triage.
 
-`homing` is two things at once:
+`homing` ships two CLI tools that share a substrate:
 
-1. **A tool.** Walks `$HOME`, classifies what it finds, and produces a parallel structured representation that any agent can read to understand the machine in seconds.
-2. **A harness.** The repo itself is meant to be cloned on a machine, opened in Claude Code (or similar), and the agent reads `BOOTSTRAP.md` to figure out what the user wants — generate a migration bundle, apply one, or just map the current laptop.
+1. **`homing`** — walks `$HOME`, classifies dev projects, produces a structured `~/system/` representation.
+2. **`cabinet`** — walks personal-document folders (`~/Documents`, `~/Pictures`, `~/Downloads`), triages messy piles into reversible move/archive/keep decisions.
+
+Both are driven by the orchestrating Claude Code session via the `migrate` skill (auto-installed by `bootstrap.sh`). LLM-tier classification runs through Claude Code subagents — no `ANTHROPIC_API_KEY` needed when used inside Claude Code.
 
 The tool is portable across Linux, macOS, Windows. The output is per-machine. The bundle is physical-transfer only (USB stick, age-encrypted secrets) by design — nothing about your personal config layer goes through a network.
 

@@ -80,7 +80,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. install the migrate skill into ~/.claude/skills/ so any Claude Code
+# 4. poppler-utils — required by pdf2image for cabinet's PDF first-page render.
+#    Best-effort: only installs if apt is present; doesn't fail otherwise.
+# ---------------------------------------------------------------------------
+if command -v pdftoppm >/dev/null 2>&1; then
+  echo "[3.5/4] poppler-utils: already present ($(pdftoppm -v 2>&1 | head -1))"
+elif command -v apt-get >/dev/null 2>&1; then
+  echo "[3.5/4] installing poppler-utils via apt (requires sudo, prompts once)..."
+  if sudo -n apt-get install -y poppler-utils >/dev/null 2>&1 || sudo apt-get install -y poppler-utils >/dev/null 2>&1; then
+    echo "      installed"
+  else
+    echo "      WARNING: poppler-utils not installed (cabinet's PDF render will fail). Install manually: sudo apt install poppler-utils"
+  fi
+elif command -v brew >/dev/null 2>&1; then
+  brew install poppler 2>&1 | tail -1
+else
+  echo "[3.5/4] poppler-utils: not present and no apt/brew detected — install manually for cabinet PDF features"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. install the migrate skill into ~/.claude/skills/ so any Claude Code
 #    session on this machine has the orchestrator playbook available.
 # ---------------------------------------------------------------------------
 SKILL_SRC="${REPO_ROOT}/skills/migrate/SKILL.md"

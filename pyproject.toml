@@ -34,6 +34,10 @@ dependencies = [
     "python-frontmatter>=1.0",
     "anthropic>=0.30",
     "rich>=13",
+    # cabinet (sibling package): personal-document triage
+    "Pillow>=10",
+    "pdf2image>=1.17",
+    "pypdf>=4",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +51,7 @@ dev = [
 
 [project.scripts]
 homing = "homing.cli:app"
+cabinet = "cabinet.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/example/homing"
