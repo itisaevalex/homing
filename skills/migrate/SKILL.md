@@ -77,7 +77,13 @@ cabinet scan ~/Documents ~/Pictures ~/Downloads --output-dir ~/cabinet
 Show the user the scan summary (folder count, file count, homogeneity verdicts). **Confirm the scope before classifying.**
 
 ```bash
-cabinet classify --output-dir ~/cabinet  # rules-first, LLM fallback (needs API key)
+cabinet classify --output-dir ~/cabinet --via-orchestrator
+# This emits ~/cabinet/batches/batch-NNN.json for each remaining unknown unit.
+# YOU (the orchestrator) fan out subagents in parallel, one per batch, and write
+# results to ~/cabinet/batches/batch-NNN.results.json. Then:
+cabinet ingest-findings --output-dir ~/cabinet
+# This parses the results files, writes findings to the worklist.
+# No ANTHROPIC_API_KEY needed — subagents use Claude Code's session auth.
 cabinet triage --output-dir ~/cabinet    # writes ~/cabinet/triage.md
 ```
 
