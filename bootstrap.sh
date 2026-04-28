@@ -130,6 +130,27 @@ if [ -f "$SKILL_SRC" ]; then
   else
     echo "[5/5] migrate skill: already up to date at $SKILL_DEST_DIR"
   fi
+
+  # If the user manages dotfiles with chezmoi (very common), the migrate skill
+  # is installed by THIS script — chezmoi must NOT track it, otherwise the
+  # tracked copy drifts from the live one every time we update the skill in
+  # the homing repo. Append an idempotent managed block to .chezmoiignore so
+  # chezmoi stops touching the skill dir. Reversible via the BEGIN/END markers.
+  CHEZMOI_SRC_DIR="${HOME}/.local/share/chezmoi"
+  if command -v chezmoi >/dev/null 2>&1 && [ -d "$CHEZMOI_SRC_DIR" ]; then
+    CHEZMOI_IGNORE="$CHEZMOI_SRC_DIR/.chezmoiignore"
+    if [ ! -f "$CHEZMOI_IGNORE" ] || ! grep -q "^# BEGIN homing-managed$" "$CHEZMOI_IGNORE" 2>/dev/null; then
+      {
+        echo ""
+        echo "# BEGIN homing-managed"
+        echo "# These paths are installed by homing's bootstrap.sh, not by chezmoi."
+        echo "# Removing this block re-enables chezmoi tracking (expect drift)."
+        echo ".claude/skills/migrate"
+        echo "# END homing-managed"
+      } >> "$CHEZMOI_IGNORE"
+      echo "      chezmoi: added homing-managed block to $CHEZMOI_IGNORE"
+    fi
+  fi
 else
   echo "[5/5] migrate skill: source not found at $SKILL_SRC (skipping)"
 fi
