@@ -222,13 +222,295 @@ def rules(
 
 
 # ---------------------------------------------------------------------------
-# Phase D — classify (stub)
+# Phase D — classify
 # ---------------------------------------------------------------------------
 
+_DEFAULT_CLASSIFY_THRESHOLD = 0.5
+_DEFAULT_CLASSIFY_BATCH_SIZE = 12
 
-@app.command(help="Phase D: LLM classification for low-confidence units (stub).")
-def classify() -> None:
-    _stub("classify")
+
+@app.command(
+    help=(
+        "Phase D: LLM classification for low-confidence units. With "
+        "--via-orchestrator, emits batches under <system-dir>/batches/ for "
+        "the orchestrating Claude Code session to fan out subagents on; no "
+        "API key needed. Without --via-orchestrator, the standalone path is "
+        "not yet implemented (set --via-orchestrator inside Claude Code)."
+    )
+)
+def classify(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR,
+        "--system-dir",
+        help="System directory. Defaults to ~/system.",
+    ),
+    via_orchestrator: bool = typer.Option(
+        False,
+        "--via-orchestrator",
+        help=(
+            "Defer LLM calls to the orchestrating Claude Code session. "
+            "Writes <system-dir>/batches/batch-NNN.json per unknown unit. "
+            "After fan-out, run 'homing ingest-findings' to persist results. "
+            "No ANTHROPIC_API_KEY needed."
+        ),
+    ),
+    threshold: float = typer.Option(
+        _DEFAULT_CLASSIFY_THRESHOLD,
+        "--threshold",
+        min=0.0,
+        max=1.0,
+        help=(
+            "Confidence below which a unit is considered 'unknown' and "
+            "needs LLM classification. Default 0.5."
+        ),
+    ),
+    batch_size: int = typer.Option(
+        _DEFAULT_CLASSIFY_BATCH_SIZE,
+        "--batch-size",
+        min=1,
+        help="Number of units per orchestrator batch.",
+    ),
+) -> None:
+    if not via_orchestrator:
+        _console.print(
+            "[red]error:[/] standalone classify (Anthropic API direct) is not "
+            "yet implemented. Pass --via-orchestrator if you're inside a "
+            "Claude Code session — that path is fully wired."
+        )
+        raise typer.Exit(code=1)
+
+    system_dir = system_dir.expanduser().resolve()
+    db_path = system_dir / "worklist.sqlite"
+    if not db_path.is_file():
+        _console.print(
+            f"[red]error:[/] no worklist at {db_path}. "
+            f"Run 'homing enumerate' (and ideally 'homing rules') first."
+        )
+        raise typer.Exit(code=2)
+
+    # Identify units that need LLM classification: max rule-finding confidence
+    # is below threshold, OR the unit has no findings at all.
+    unknowns: list[dict[str, Any]] = []
+    with Worklist(db_path) as wl:
+        for unit in wl.all_units():
+            findings = wl.findings_for(unit["name"])
+            if findings:
+                max_conf = max(float(f.get("confidence", 0.0)) for f in findings)
+                if max_conf >= threshold:
+                    continue
+            # Compact rule context so the subagent has signal without
+            # re-reading the worklist.
+            rule_context = [
+                {
+                    "rule": f.get("rule"),
+                    "confidence": f.get("confidence"),
+                    "classifications": f.get("classifications"),
+                }
+                for f in findings
+            ]
+            unknowns.append(
+                {
+                    "name": unit["name"],
+                    "kind": unit.get("kind"),
+                    "path": unit.get("path"),
+                    "metadata": unit.get("metadata") or {},
+                    "rule_findings": rule_context,
+                }
+            )
+
+    # Emit batches/ directory (always, even with 0 unknowns — explicit
+    # completion signal so the orchestrator never hangs).
+    batches_dir = system_dir / "batches"
+    batches_dir.mkdir(parents=True, exist_ok=True)
+    for old in batches_dir.glob("batch-*.json"):
+        old.unlink()
+    for old in batches_dir.glob("batch-*.results.json"):
+        old.unlink()
+
+    unknowns_path = system_dir / "unknowns.json"
+    unknowns_path.write_text(json.dumps(unknowns, indent=2, default=str))
+
+    n_batches = 0
+    for i in range(0, len(unknowns), batch_size):
+        batch = unknowns[i : i + batch_size]
+        (batches_dir / f"batch-{i // batch_size:03d}.json").write_text(
+            json.dumps(batch, indent=2, default=str)
+        )
+        n_batches += 1
+
+    if not unknowns:
+        _console.print(
+            f"[green]--via-orchestrator:[/] 0 unknowns — every unit "
+            f"classified above threshold {threshold} by deterministic "
+            f"rules. No subagent fan-out needed.\n"
+            f"[cyan]Next:[/] proceed to 'homing draft' / 'homing index'."
+        )
+    else:
+        _console.print(
+            f"[cyan]--via-orchestrator:[/] wrote {len(unknowns)} unknowns "
+            f"as {n_batches} batch(es) of up to {batch_size} units to {batches_dir}\n"
+            f"[cyan]Next:[/] orchestrator fans out subagents on each batch, "
+            f"writes batch-NNN.results.json, then run "
+            f"'homing ingest-findings --system-dir {system_dir}'."
+        )
+
+
+@app.command(name="ingest-findings")
+def ingest_findings(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR,
+        "--system-dir",
+        help="System directory. Defaults to ~/system.",
+    ),
+    findings_file: Path = typer.Option(
+        None,
+        "--findings",
+        help=(
+            "Single findings JSON file. If omitted, reads "
+            "<system-dir>/batches/batch-*.results.json."
+        ),
+    ),
+    rule_name: str = typer.Option(
+        "claude-code-subagent",
+        "--rule-name",
+        help="Rule name to record on each finding (for provenance).",
+    ),
+) -> None:
+    """Ingest classification results from orchestrator-driven subagent runs.
+
+    Each entry must have: name (unit slug), class_id, confidence, evidence
+    (list of {path, reason} dicts or strings). Tolerates trailing data after
+    the JSON array and missing fields. Empty evidence is auto-flagged as
+    needs-human (citation rule).
+    """
+    system_dir = system_dir.expanduser().resolve()
+    db_path = system_dir / "worklist.sqlite"
+    if not db_path.is_file():
+        _console.print(
+            f"[red]error:[/] no worklist at {db_path}. "
+            f"Run 'homing enumerate' first."
+        )
+        raise typer.Exit(code=2)
+
+    if findings_file:
+        files = [findings_file]
+    else:
+        files = sorted((system_dir / "batches").glob("*.results.json"))
+        if not files:
+            _console.print(
+                f"[red]error:[/] no batch results in "
+                f"{system_dir / 'batches'}. Did the orchestrator run?"
+            )
+            raise typer.Exit(code=2)
+
+    written = 0
+    failed = 0
+    by_class: dict[str, int] = {}
+
+    with Worklist(db_path) as wl:
+        run_id = wl.start_run("ingest-findings")
+        for f in files:
+            text = f.read_text()
+            try:
+                results = json.loads(text)
+            except json.JSONDecodeError:
+                # Tolerate trailing prose after a valid JSON value.
+                try:
+                    results, _ = json.JSONDecoder().raw_decode(text)
+                except Exception as exc:
+                    _console.print(
+                        f"[yellow]skip[/] {f.name}: unparseable ({exc})"
+                    )
+                    failed += 1
+                    continue
+            if not isinstance(results, list):
+                results = [results]
+            for r in results:
+                try:
+                    name = str(r["name"])
+                    cid = str(r["class_id"])
+                    conf = float(r.get("confidence", 0.5))
+                    ev_in = r.get("evidence", [])
+                    if isinstance(ev_in, str):
+                        ev_items = [{"path": "(no path)", "reason": ev_in}]
+                    elif isinstance(ev_in, list):
+                        ev_items = []
+                        for e in ev_in:
+                            if isinstance(e, dict):
+                                ev_items.append(
+                                    {
+                                        "path": e.get("path", "(no path)"),
+                                        "reason": (
+                                            e.get("reason")
+                                            or e.get("note")
+                                            or e.get("why")
+                                            or str(e)
+                                        ),
+                                    }
+                                )
+                            else:
+                                ev_items.append(
+                                    {"path": "(no path)", "reason": str(e)}
+                                )
+                    else:
+                        ev_items = [{"path": "(no path)", "reason": str(ev_in)}]
+                    # Citation rule: empty evidence → flag for manual review
+                    # rather than silently accepting an uncited classification.
+                    if not ev_items:
+                        ev_items = [
+                            {
+                                "path": "(subagent)",
+                                "reason": "no evidence supplied — manual review required",
+                            }
+                        ]
+                        cid = "needs-human"
+                        conf = 0.0
+                    if wl.unit(name) is None:
+                        wl.event(
+                            name=None,
+                            type="orphan",
+                            message=(
+                                f"ingest-findings: result for {name!r} but "
+                                f"no such unit in worklist"
+                            ),
+                        )
+                        failed += 1
+                        continue
+                    wl.record_finding(
+                        name,
+                        rule_name,
+                        confidence=max(0.0, min(1.0, conf)),
+                        classifications={"class_id": cid},
+                        evidence=ev_items,
+                    )
+                    try:
+                        wl.update_status(name, "classified")
+                    except Exception:
+                        pass
+                    by_class[cid] = by_class.get(cid, 0) + 1
+                    written += 1
+                except Exception as exc:
+                    wl.event(
+                        name=None,
+                        type="ingest-error",
+                        message=f"{f.name}: {exc}",
+                    )
+                    failed += 1
+        run_exit_code = 1 if failed > 0 else 0
+        wl.end_run(
+            run_id,
+            exit_code=run_exit_code,
+            summary=f"ingested {written}, failed {failed}",
+        )
+
+    _console.print(
+        f"[green]ingested:[/] {written}   [yellow]failed:[/] {failed}"
+    )
+    if by_class:
+        for c, n in sorted(by_class.items(), key=lambda x: -x[1]):
+            _console.print(f"  {c:30s} {n}")
+    if failed > 0:
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------

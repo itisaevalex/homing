@@ -172,6 +172,11 @@ class Worklist:
         ).fetchall()
         return [_row_to_unit(r) for r in rows]
 
+    def all_units(self) -> list[dict[str, Any]]:
+        """All units regardless of status, sorted by name."""
+        rows = self._conn.execute("SELECT * FROM units ORDER BY name").fetchall()
+        return [_row_to_unit(r) for r in rows]
+
     # -- findings ----------------------------------------------------------
 
     def record_finding(
