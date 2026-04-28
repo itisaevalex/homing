@@ -221,6 +221,11 @@ def test_classify_stub_returns_nonzero() -> None:
     assert result.exit_code == 1
 
 
-def test_draft_stub_returns_nonzero() -> None:
-    result = runner.invoke(app, ["draft", "alpha"])
-    assert result.exit_code == 1
+def test_draft_returns_nonzero_when_unit_missing(tmp_path: Path) -> None:
+    # draft is now a real command (Phase E); without a worklist or matching unit
+    # it should exit non-zero (missing prerequisite). Stays out of the LLM path
+    # because the lookup fails first.
+    result = runner.invoke(
+        app, ["draft", "nonexistent", "--system-dir", str(tmp_path)]
+    )
+    assert result.exit_code != 0
