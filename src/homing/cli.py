@@ -23,6 +23,7 @@ from homing import index as index_module
 from homing import orchestrator as orchestrator_module
 from homing import platform as platform_module
 from homing import summary as summary_module
+from homing import validate as validate_module
 from homing.worklist import Worklist
 from homing.draft_cli import register_draft_command
 
@@ -238,14 +239,256 @@ register_draft_command(app)
 
 
 # ---------------------------------------------------------------------------
-# Phase F — validate (stub)
+# Phase F — validate
 # ---------------------------------------------------------------------------
 
 
-@app.command(help="Phase F: fresh-agent validation of a manifest (stub).")
-def validate(name: str = typer.Argument(..., help="Unit name.")) -> None:
-    del name
-    _stub("validate")
+_DEFAULT_VALIDATE_MODEL = "claude-sonnet-4-6"
+
+
+def _agent_md_path_for(system_dir: Path, unit_name: str) -> Path:
+    """Resolve the on-disk AGENT.md for a unit under ``<system-dir>``."""
+    return system_dir.resolve() / "projects" / unit_name / "AGENT.md"
+
+
+def _print_validation_result(result: validate_module.ValidationResult) -> None:
+    """Render a ValidationResult as a rich-formatted block."""
+    color = "green" if result.pass_threshold else "red"
+    verdict = "PASS" if result.pass_threshold else "FAIL"
+    _console.print(
+        f"[bold {color}]{verdict}[/] [bold]{result.unit_name}[/] "
+        f"confidence={result.confidence_score}/10  "
+        f"({result.tokens_input}+{result.tokens_output} tok, "
+        f"{result.elapsed_seconds:.1f}s)"
+    )
+    _console.print(f"  manifest: {result.agent_md_path}")
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("question", style="cyan", no_wrap=True)
+    table.add_column("answer (truncated)")
+    for key in validate_module.QUESTION_KEYS:
+        if key == "wishlist":
+            continue
+        ans = result.answers.get(key, "")
+        # Compact preview — full answer lives in the worklist.
+        preview = ans.replace("\n", " ").strip()
+        if len(preview) > 220:
+            preview = preview[:217] + "..."
+        table.add_row(key, preview or "(empty)")
+    _console.print(table)
+
+    if result.wishlist:
+        _console.print("[bold]wishlist (gaps in AGENT.md):[/]")
+        for item in result.wishlist:
+            _console.print(f"  - {item}")
+
+
+def _persist_validation(
+    worklist: Worklist,
+    result: validate_module.ValidationResult,
+) -> None:
+    """Record the validation as a worklist finding and bump status on pass."""
+    unit = worklist.unit(result.unit_name)
+    if unit is None:
+        # No worklist entry for this name — skip persistence quietly. The
+        # validator still printed its result; the user just isn't tied
+        # into the cross-phase state machine.
+        worklist.event(
+            None,
+            type="warn",
+            message=(
+                f"validate: unit {result.unit_name!r} not in worklist; "
+                "finding not persisted"
+            ),
+        )
+        return
+
+    classifications = {
+        "confidence_score": result.confidence_score,
+        "pass": result.pass_threshold,
+        "answers": result.answers,
+        "wishlist": result.wishlist,
+        "rationale": result.rationale,
+        "model": result.model,
+    }
+    evidence = [(str(result.agent_md_path), "validation source")]
+    worklist.record_finding(
+        result.unit_name,
+        rule="validate",
+        confidence=result.confidence_score / 10.0,
+        classifications=classifications,
+        evidence=evidence,
+    )
+    if result.pass_threshold:
+        try:
+            worklist.update_status(result.unit_name, "validated")
+        except (KeyError, ValueError) as e:
+            worklist.event(
+                result.unit_name,
+                type="warn",
+                message=f"validate: could not update status: {e}",
+            )
+
+
+@app.command(help="Phase F: fresh-agent validation of one or all manifests.")
+def validate(
+    name: Optional[str] = typer.Argument(
+        None,
+        help=(
+            "Unit name to validate. Resolves to "
+            "<system-dir>/projects/<name>/AGENT.md. "
+            "Omit when --all is set."
+        ),
+    ),
+    all_units: bool = typer.Option(
+        False,
+        "--all",
+        help=(
+            "Validate every <system-dir>/projects/*/AGENT.md found. "
+            "Runs in serial to keep API spend predictable."
+        ),
+    ),
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR,
+        "--system-dir",
+        help="System directory. Defaults to ~/system.",
+    ),
+    model: str = typer.Option(
+        _DEFAULT_VALIDATE_MODEL,
+        "--model",
+        help="Anthropic model id. Defaults to Sonnet (CLAUDE.md default).",
+    ),
+) -> None:
+    if all_units and name is not None:
+        _console.print(
+            "[red]error:[/] pass either a unit name OR --all, not both."
+        )
+        raise typer.Exit(code=2)
+    if not all_units and name is None:
+        _console.print(
+            "[red]error:[/] supply a unit name or pass --all."
+        )
+        raise typer.Exit(code=2)
+
+    system_dir = system_dir.resolve()
+    db_path = system_dir / "worklist.sqlite"
+    worklist: Optional[Worklist] = None
+    if db_path.is_file():
+        worklist = Worklist(db_path)
+        run_id = worklist.start_run("validate")
+    else:
+        run_id = None
+
+    pass_count = 0
+    fail_count = 0
+    error_count = 0
+    score_sum = 0
+    score_n = 0
+    exit_code = 0
+
+    try:
+        if all_units:
+            projects_dir = system_dir / "projects"
+            if not projects_dir.is_dir():
+                _console.print(
+                    f"[red]error:[/] no projects directory at {projects_dir}"
+                )
+                raise typer.Exit(code=2)
+            paths = sorted(projects_dir.glob("*/AGENT.md"))
+            if not paths:
+                _console.print(
+                    f"[yellow]warn:[/] no AGENT.md files under {projects_dir}"
+                )
+                # Empty-set is technically a pass; exit 0.
+                return
+        else:
+            assert name is not None
+            single = _agent_md_path_for(system_dir, name)
+            if not single.is_file():
+                _console.print(
+                    f"[red]error:[/] no AGENT.md at {single}. "
+                    "Have you run `homing draft` for this unit?"
+                )
+                raise typer.Exit(code=2)
+            paths = [single]
+
+        for agent_md_path in paths:
+            unit_name = agent_md_path.parent.name
+            try:
+                result = validate_module.validate_agent_md(
+                    agent_md_path,
+                    model=model,
+                    unit_name=unit_name,
+                )
+            except (FileNotFoundError, ValueError) as e:
+                error_count += 1
+                exit_code = 1
+                _console.print(
+                    f"[red]error[/] validating {unit_name}: {e}"
+                )
+                if worklist is not None:
+                    worklist.event(
+                        None,
+                        type="error",
+                        message=f"validate {unit_name}: {e}",
+                    )
+                continue
+            except Exception as e:  # noqa: BLE001 — surface SDK errors clearly
+                error_count += 1
+                exit_code = 1
+                _console.print(
+                    f"[red]error[/] LLM call failed for {unit_name}: {e}"
+                )
+                if worklist is not None:
+                    worklist.event(
+                        None,
+                        type="error",
+                        message=f"validate {unit_name}: {e}",
+                    )
+                continue
+
+            _print_validation_result(result)
+            score_sum += result.confidence_score
+            score_n += 1
+            if result.pass_threshold:
+                pass_count += 1
+            else:
+                fail_count += 1
+                # Single-name path returns nonzero on fail; --all path
+                # surfaces failures via the summary table.
+                if not all_units:
+                    exit_code = 1
+
+            if worklist is not None:
+                _persist_validation(worklist, result)
+
+        if all_units:
+            avg = score_sum / score_n if score_n else 0.0
+            summary_table = Table(
+                title="validate summary", show_header=True, header_style="bold"
+            )
+            summary_table.add_column("metric")
+            summary_table.add_column("value", justify="right")
+            summary_table.add_row("manifests considered", str(len(paths)))
+            summary_table.add_row("passed (>= 7/10)", str(pass_count))
+            summary_table.add_row("failed", str(fail_count))
+            summary_table.add_row("errored", str(error_count))
+            summary_table.add_row("avg confidence", f"{avg:.2f}")
+            _console.print(summary_table)
+            if fail_count or error_count:
+                exit_code = 1
+
+        if worklist is not None and run_id is not None:
+            summary_msg = (
+                f"{pass_count} pass, {fail_count} fail, {error_count} error"
+            )
+            worklist.end_run(run_id, exit_code=exit_code, summary=summary_msg)
+    finally:
+        if worklist is not None:
+            worklist.close()
+
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
 
 
 # ---------------------------------------------------------------------------
