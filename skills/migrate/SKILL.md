@@ -58,14 +58,18 @@ homing rules                        # Phase C — deterministic rule plugins
 homing index                        # Phase G — aggregate frontmatter → JSON
 ```
 
-If `ANTHROPIC_API_KEY` is set:
+LLM-touching phases (no API key needed when inside Claude Code):
 ```bash
-homing summary                      # Phase B — readable overview
-homing draft <name>                 # Phase E — generate AGENT.md per active project
-homing validate <name>              # Phase F — fresh-agent test
+homing summary                                  # Phase B — readable overview, deterministic
+homing draft <name> --via-orchestrator          # Phase E — emits draft request bundle
+# YOU (the orchestrator) read <system-dir>/draft-requests/<name>.json,
+# fire a sub-agent that drafts the AGENT.md, write to target_path.
+homing validate --all --via-orchestrator        # Phase F — emits validation requests
+# YOU fire sub-agents per request, write JSON results to <system-dir>/validate-results/.
+homing ingest-validations                       # persist results to worklist
 ```
 
-Without an API key, skip the LLM-touching phases. The deterministic ones still produce a full structural snapshot.
+Standalone (with `ANTHROPIC_API_KEY`): same commands minus `--via-orchestrator`.
 
 ### A.2 — personal documents (cabinet)
 

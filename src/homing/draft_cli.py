@@ -184,9 +184,100 @@ def register_draft_command(app: typer.Typer) -> None:
         model: str = typer.Option(_DEFAULT_MODEL, "--model"),
         policy: str = typer.Option("proposed", "--policy"),
         project_path: Optional[Path] = typer.Option(None, "--project-path"),
+        via_orchestrator: bool = typer.Option(
+            False,
+            "--via-orchestrator",
+            help=(
+                "Defer the LLM call to the orchestrating Claude Code session. "
+                "Writes a draft request bundle (collected inputs + schema + "
+                "target path + conflict policy) to <system-dir>/draft-requests/<name>.json. "
+                "The orchestrator (you) reads it, runs a sub-agent that drafts the AGENT.md "
+                "and writes it to the target path. No ANTHROPIC_API_KEY needed."
+            ),
+        ),
     ) -> None:
-        code = _run_draft(name, system_dir, model, policy, project_path)
+        if via_orchestrator:
+            code = _run_draft_via_orchestrator(name, system_dir, project_path, policy)
+        else:
+            code = _run_draft(name, system_dir, model, policy, project_path)
         raise typer.Exit(code=code)
+
+
+def _run_draft_via_orchestrator(
+    name: str,
+    system_dir: Path,
+    project_path: Optional[Path],
+    policy: str,
+) -> int:
+    """Emit a draft request bundle for the orchestrator to handle, then exit."""
+    import json
+    from homing import draft as _draft_mod
+
+    system_dir = system_dir.expanduser().resolve()
+
+    # Resolve project path (worklist lookup or explicit override)
+    if project_path is None:
+        try:
+            project_path = _project_path_for(name, system_dir)
+        except FileNotFoundError as exc:
+            _console.print(f"[red]error:[/red] {exc}")
+            return 2
+    project_path = project_path.expanduser().resolve()
+    if not project_path.is_dir():
+        _console.print(f"[red]error:[/red] project path not found: {project_path}")
+        return 2
+
+    target_path = system_dir / "projects" / name / "AGENT.md"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists() and policy == "proposed":
+        target_path = target_path.with_name("AGENT.proposed.md")
+    elif target_path.exists() and policy == "skip":
+        _console.print(f"[yellow]skipped:[/yellow] {target_path} already exists (policy=skip)")
+        return 0
+    elif target_path.exists() and policy == "fail":
+        _console.print(f"[red]error:[/red] {target_path} exists and policy=fail")
+        return 2
+
+    # Collect the same input bundle that draft.py would have sent to the LLM
+    try:
+        inputs = _draft_mod.collect_inputs(project_path)
+    except Exception as exc:
+        _console.print(f"[red]error collecting inputs:[/red] {exc}")
+        return 2
+
+    schema_text = _draft_mod._load_schema_text()
+    user_msg = _draft_mod._build_user_message(project_path, inputs)
+
+    requests_dir = system_dir / "draft-requests"
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    request_path = requests_dir / f"{name}.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "name": name,
+                "project_path": str(project_path),
+                "target_path": str(target_path),
+                "schema": schema_text,
+                "user_message": user_msg,
+                "input_files": [str(f.path) for f in inputs],
+                "policy": policy,
+                "instructions": (
+                    "You are the orchestrator. Spawn a sub-agent and pass it the user_message + schema. "
+                    "The sub-agent should produce a complete AGENT.md (frontmatter + body) following the "
+                    "schema, citing the listed input_files in meta.sources. Write the result to target_path. "
+                    "Do NOT overwrite target_path if it exists — the policy already resolved this."
+                ),
+            },
+            indent=2,
+        )
+    )
+
+    _console.print(
+        f"[cyan]draft --via-orchestrator:[/cyan] request written to {request_path}\n"
+        f"[cyan]Target:[/cyan] {target_path}\n"
+        f"[cyan]Next:[/cyan] orchestrator reads the request, fires a sub-agent, writes AGENT.md to target."
+    )
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

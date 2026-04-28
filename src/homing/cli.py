@@ -358,7 +358,21 @@ def validate(
         "--model",
         help="Anthropic model id. Defaults to Sonnet (CLAUDE.md default).",
     ),
+    via_orchestrator: bool = typer.Option(
+        False,
+        "--via-orchestrator",
+        help=(
+            "Defer LLM calls to the orchestrating Claude Code session. "
+            "Writes a validation request bundle per AGENT.md to "
+            "<system-dir>/validate-requests/. The orchestrator reads it, "
+            "fires sub-agents, and writes results to "
+            "<system-dir>/validate-results/. Run 'homing ingest-validations' "
+            "afterward to persist findings to the worklist. No API key needed."
+        ),
+    ),
 ) -> None:
+    if via_orchestrator:
+        return _validate_via_orchestrator(name, all_units, system_dir)
     if all_units and name is not None:
         _console.print(
             "[red]error:[/] pass either a unit name OR --all, not both."
@@ -747,6 +761,162 @@ def _to_epoch(value: Any) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+
+# ---------------------------------------------------------------------------
+# Phase F — validate via orchestrator (no API key needed)
+# ---------------------------------------------------------------------------
+
+
+def _validate_via_orchestrator(
+    name: Optional[str],
+    all_units: bool,
+    system_dir: Path,
+) -> None:
+    """Emit validation request files for the orchestrator to handle."""
+    import json as _json
+
+    if all_units and name is not None:
+        _console.print("[red]error:[/] pass either a unit name OR --all, not both.")
+        raise typer.Exit(code=2)
+    if not all_units and name is None:
+        _console.print("[red]error:[/] supply a unit name or pass --all.")
+        raise typer.Exit(code=2)
+
+    system_dir = system_dir.resolve()
+
+    if all_units:
+        projects_dir = system_dir / "projects"
+        if not projects_dir.is_dir():
+            _console.print(f"[red]error:[/] no projects directory at {projects_dir}")
+            raise typer.Exit(code=2)
+        agent_md_paths = sorted(projects_dir.glob("*/AGENT.md"))
+    else:
+        agent_md_paths = [system_dir / "projects" / name / "AGENT.md"]
+
+    requests_dir = system_dir / "validate-requests"
+    results_dir = system_dir / "validate-results"
+    requests_dir.mkdir(parents=True, exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    written = 0
+    for agent_md in agent_md_paths:
+        if not agent_md.is_file():
+            _console.print(f"[yellow]skip:[/] {agent_md} (not a file)")
+            continue
+        unit_name = agent_md.parent.name
+        agent_md_text = agent_md.read_text(encoding="utf-8")
+        user_msg = validate_module._build_user_message(agent_md, agent_md_text)
+        request = {
+            "unit_name": unit_name,
+            "agent_md_path": str(agent_md),
+            "user_message": user_msg,
+            "questions": dict(validate_module.QUESTIONS),
+            "result_path": str(results_dir / f"{unit_name}.json"),
+            "instructions": (
+                "You are the orchestrator. Spawn a fresh sub-agent that has NOT seen this "
+                "project before. Pass it the user_message verbatim. The sub-agent must answer "
+                "every question and emit a JSON object with: confidence_score (1-10), "
+                "answers (dict keyed by question), wishlist (list of <=3 strings). "
+                "Write the JSON to result_path. Then run 'homing ingest-validations' to persist."
+            ),
+        }
+        (requests_dir / f"{unit_name}.json").write_text(_json.dumps(request, indent=2))
+        written += 1
+
+    _console.print(
+        f"[cyan]validate --via-orchestrator:[/cyan] wrote {written} request(s) to {requests_dir}\n"
+        f"[cyan]Results expected at:[/cyan] {results_dir}\n"
+        f"[cyan]Next:[/cyan] orchestrator fans out sub-agents, then 'homing ingest-validations'."
+    )
+
+
+@app.command(name="ingest-validations")
+def ingest_validations(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR,
+        "--system-dir",
+        help="System directory. Defaults to ~/system.",
+    ),
+) -> None:
+    """Ingest sub-agent-produced validation results into the worklist.
+
+    Reads <system-dir>/validate-results/<unit>.json files. Each must contain
+    confidence_score, answers, wishlist. Tolerates missing/extra fields.
+    """
+    import json as _json
+
+    system_dir = system_dir.resolve()
+    results_dir = system_dir / "validate-results"
+    if not results_dir.is_dir():
+        _console.print(f"[red]error:[/] no {results_dir}. Run 'homing validate --via-orchestrator' first.")
+        raise typer.Exit(code=2)
+
+    db_path = system_dir / "worklist.sqlite"
+    worklist: Optional[Worklist] = None
+    if db_path.is_file():
+        worklist = Worklist(db_path)
+        run_id = worklist.start_run("ingest-validations")
+    else:
+        run_id = None
+
+    written = 0
+    failed = 0
+    pass_n = 0
+    fail_n = 0
+
+    try:
+        for f in sorted(results_dir.glob("*.json")):
+            try:
+                data = _json.loads(f.read_text())
+                unit_name = data.get("unit_name") or f.stem
+                score = int(data.get("confidence_score", 0))
+                score = max(0, min(10, score))
+                passed = score >= validate_module.PASS_THRESHOLD
+                answers = data.get("answers", {})
+                wishlist = data.get("wishlist", [])
+                if worklist is not None:
+                    try:
+                        worklist.record_finding(
+                            unit_name,
+                            rule="validate",
+                            confidence=score / 10.0,
+                            classifications={"score": score, "pass": passed},
+                            evidence=[
+                                {"path": str(f), "reason": "orchestrator validation result"}
+                            ],
+                        )
+                        try:
+                            if passed:
+                                worklist.update_status(unit_name, "validated")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        worklist.event(
+                            unit_name=unit_name,
+                            type="warn",
+                            message=f"ingest-validations: {e}",
+                        )
+                if passed:
+                    pass_n += 1
+                else:
+                    fail_n += 1
+                written += 1
+            except Exception as exc:
+                _console.print(f"[yellow]skip[/] {f.name}: {exc}")
+                failed += 1
+        if worklist is not None and run_id is not None:
+            worklist.end_run(run_id, exit_code=0, summary=f"ingested {written}, failed {failed}")
+    finally:
+        if worklist is not None:
+            worklist.close()
+
+    _console.print(
+        f"[green]ingested:[/] {written}   "
+        f"[bold]pass:[/] {pass_n}   [bold]fail:[/] {fail_n}   "
+        f"[yellow]parse-errors:[/] {failed}"
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
