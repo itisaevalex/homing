@@ -1,0 +1,239 @@
+# Cabinet content taxonomy.
+#
+# Flat list of personal-document classes that cabinet may assign to a unit
+# (folder or file). Keep this readable — the LLM classifier sees it verbatim
+# in the system prompt, and a human reviews it on disk.
+#
+# Field reference:
+#   id                 kebab-case identifier; load-bearing across phases.
+#   description        one sentence — the LLM cites this when picking the class.
+#   migrate_strategy   keep | archive | dedupe | review
+#                      keep    = leave in place, just label it
+#                      archive = move to the archive pile post-approval
+#                      dedupe  = collapse copies to a chosen primary
+#                      review  = needs a human pass before any action
+#   typical_signals    extensions, EXIF hints, filename patterns, content keywords
+#                      that point a rule (or the LLM) at this class.
+#   sensitive          bool — likely to contain PII (passport, tax, contracts).
+#                      Cabinet treats these with extra caution: never auto-archive,
+#                      always cite, prefer "review" if confidence is borderline.
+#
+# Add classes here when a new pattern shows up in real user data. Don't try to be
+# exhaustive on day one — the "unknown" bucket is the safety net.
+
+version: 1
+
+classes:
+  - id: trip-photos
+    description: A folder of photos from a single trip — narrow date range, GPS clustered.
+    migrate_strategy: keep
+    typical_signals:
+      - extensions: .jpg, .jpeg, .heic, .raw, .dng
+      - EXIF GPS coords clustered within ~50km
+      - EXIF date range under 3 weeks
+      - filename pattern IMG_NNNN / DSC_NNNN / iPhone-style
+    sensitive: false
+
+  - id: raw-camera
+    description: Camera dump folder — IMG_/DSC_/P_ filenames, mixed dates, no trip cohesion.
+    migrate_strategy: review
+    typical_signals:
+      - extensions: .jpg, .jpeg, .raw, .dng, .cr2, .nef
+      - filename pattern IMG_NNNN.jpg / DSC_NNNN.jpg / P_NNNNNNN.jpg
+      - EXIF camera metadata present
+    sensitive: false
+
+  - id: processed-photo
+    description: Edited / exported photos, often from Lightroom or similar — _edit, _final suffixes.
+    migrate_strategy: keep
+    typical_signals:
+      - extensions: .jpg, .png, .tiff
+      - filename suffixes: _edit, _final, -2, -edited
+      - EXIF software field non-camera (Lightroom, Photoshop, GIMP)
+    sensitive: false
+
+  - id: screenshot
+    description: Single screenshot file captured from screen.
+    migrate_strategy: archive
+    typical_signals:
+      - extensions: .png
+      - filename like "Screenshot from YYYY-MM-DD HH-MM-SS.png" or "Screen Shot ..."
+      - filename like "Screenshot_NNNNNN.png" / "CleanShot ..."
+    sensitive: false
+
+  - id: screenshot-folder
+    description: A folder consisting almost entirely of screenshots — Pictures/Screenshots, Desktop dumps.
+    migrate_strategy: archive
+    typical_signals:
+      - ">=85% .png files"
+      - parent folder name matches /screenshot/i
+      - filenames match Screenshot from / Screen Shot / CleanShot patterns
+    sensitive: false
+
+  - id: scan-of-id
+    description: Scanned identity document — passport, driver license, ID card.
+    migrate_strategy: review
+    typical_signals:
+      - extensions: .pdf, .jpg, .png
+      - filename keywords passport, id, license, driver, residence, visa
+      - small page count (1-2)
+      - content keywords passport / surname / nationality / date of birth
+    sensitive: true
+
+  - id: scan-of-document
+    description: Generic scanned paper document — sequential scan_NNNN.pdf with no specific topic yet identified.
+    migrate_strategy: review
+    typical_signals:
+      - filename pattern scan_NNNN.pdf / scan_NNNN.jpg / Scan_NNNN.pdf
+      - extensions: .pdf, .jpg
+    sensitive: false
+
+  - id: tax-document
+    description: Tax forms, returns, receipts assembled for filing — W-2, 1099, P60, T4, EU country equivalents.
+    migrate_strategy: review
+    typical_signals:
+      - filename keywords tax, return, w2, w-2, 1099, p60, t4, vat, irs
+      - content keywords taxable, deduction, gross income, refund
+    sensitive: true
+
+  - id: receipt
+    description: Single receipt or invoice — purchase, restaurant, utility.
+    migrate_strategy: archive
+    typical_signals:
+      - filename keywords receipt, invoice, bill, order
+      - extensions: .pdf, .jpg, .png
+      - small page count (1)
+    sensitive: false
+
+  - id: contract
+    description: Legal contract or agreement — employment, lease, NDA, service agreement.
+    migrate_strategy: review
+    typical_signals:
+      - filename keywords contract, agreement, nda, lease, employment, terms
+      - content keywords party, hereby, whereas, signature
+    sensitive: true
+
+  - id: certificate
+    description: Certificate or diploma — course completion, professional credential, language test.
+    migrate_strategy: keep
+    typical_signals:
+      - filename keywords certificate, diploma, ielts, toefl, gre
+      - extensions: .pdf
+    sensitive: true
+
+  - id: cv-resume
+    description: CV or resume document, often versioned in filename.
+    migrate_strategy: keep
+    typical_signals:
+      - filename matches CV*, Resume*, *cv*, *resume*
+      - extensions: .pdf, .docx
+      - content keywords experience, education, skills
+    sensitive: false
+
+  - id: textbook-pdf
+    description: Academic textbook or coursebook PDF — typically large, hundreds of pages.
+    migrate_strategy: archive
+    typical_signals:
+      - extensions: .pdf
+      - large file size (>5MB)
+      - high page count
+      - filename mentions edition, vol, chapter, course code
+    sensitive: false
+
+  - id: ebook
+    description: General-interest ebook — non-textbook reading material.
+    migrate_strategy: archive
+    typical_signals:
+      - extensions: .epub, .mobi, .azw3, .pdf
+      - filename includes author and title
+    sensitive: false
+
+  - id: document-by-year
+    description: A folder of mixed documents grouped by a single year — taxes-2023/, school-2019/.
+    migrate_strategy: keep
+    typical_signals:
+      - parent folder name contains a 4-digit year
+      - mtime range concentrated in that year
+      - mixed extensions: .pdf, .docx, .jpg
+    sensitive: false
+
+  - id: code-export
+    description: Exported source code or project dump from another tool — chat exports, bundled repos, gists.
+    migrate_strategy: archive
+    typical_signals:
+      - extensions: .py, .js, .ts, .md, .json, .ipynb
+      - filename patterns export, dump, gist, archive
+      - presence of README.md / package.json at root
+    sensitive: false
+
+  - id: project-export
+    description: Snapshot of a working project directory — node_modules excluded, pyproject.toml or similar present.
+    migrate_strategy: review
+    typical_signals:
+      - presence of pyproject.toml / package.json / Cargo.toml / go.mod
+      - mixed source extensions
+      - .git/ directory present
+    sensitive: false
+
+  - id: vendored-tooling
+    description: Bundled third-party tooling — node_modules, venv, vendored libraries copied into the source tree.
+    migrate_strategy: archive
+    typical_signals:
+      - parent folder name node_modules / venv / .venv / vendor / __pycache__
+      - mix of binaries, configs, license files
+      - very high file count
+    sensitive: false
+
+  - id: downloaded-installer
+    description: Downloaded installer or binary — .dmg, .exe, .msi, .deb, .AppImage.
+    migrate_strategy: archive
+    typical_signals:
+      - extensions: .dmg, .exe, .msi, .deb, .rpm, .AppImage, .pkg
+      - parent folder Downloads
+    sensitive: false
+
+  - id: archive-zip
+    description: Compressed archive — zip, tar, gz, rar — contents not yet inspected.
+    migrate_strategy: review
+    typical_signals:
+      - extensions: .zip, .tar, .tar.gz, .tgz, .rar, .7z
+    sensitive: false
+
+  - id: music-album
+    description: Folder of audio tracks forming a single album.
+    migrate_strategy: keep
+    typical_signals:
+      - extensions: .mp3, .flac, .m4a, .wav, .ogg
+      - homogeneous audio extensions
+      - filenames numbered like 01 - Title, 02 - Title
+    sensitive: false
+
+  - id: video-recording
+    description: Personal video recording or clip — phone capture, screen recording, camera video.
+    migrate_strategy: keep
+    typical_signals:
+      - extensions: .mp4, .mov, .mkv, .avi, .webm
+      - large file size
+    sensitive: false
+
+  - id: unknown
+    description: Could not determine class from rules or LLM with sufficient confidence — leave for human review.
+    migrate_strategy: review
+    typical_signals:
+      - mixed extensions with no dominant pattern
+      - no filename or content signal matched a known class
+    sensitive: false
+
+  - id: needs-human
+    description: |
+      Classifier is genuinely unsure. Use this when no taxonomy class fits
+      with confidence >= 0.5, or when the content looks ambiguous, mixed, or
+      potentially sensitive. Distinct from 'unknown' (which means "no signal
+      matched"); 'needs-human' means "I won't guess, please decide."
+    migrate_strategy: review
+    typical_signals:
+      - mixed content with no dominant pattern AND folder name is suggestive but ambiguous
+      - sensitive-looking but unclear classification (could be tax, contract, or correspondence)
+      - small folder (< 5 files) where sampling didn't land on representative content
+      - content read but no strong signal pointed at a single class
+    sensitive: false

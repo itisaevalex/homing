@@ -1,0 +1,201 @@
+platform: linux
+home_root: null
+project_hunter:
+  prune_directories:
+  - .cache
+  - .npm
+  - .gradle
+  - .docker
+  - .var
+  - .nv
+  - .android
+  - Android
+  - .nvm
+  - .bun
+  - .pub-cache
+  - .conda
+  - node_modules
+  - __pycache__
+  - .venv
+  - venv
+  - .pytest_cache
+  - .mypy_cache
+  - .ruff_cache
+  - .tox
+  - .git
+  - .next
+  - .nuxt
+  - target
+  - dist
+  - build
+  - out
+  - .turbo
+  - .parcel-cache
+  - .svelte-kit
+  - .vscode-server
+  - .dartServer
+  - .dart-tool
+  - Trash
+  - .crawl4ai
+  prune_paths:
+  - anaconda3/envs
+  - anaconda3/pkgs
+  - anaconda3/lib
+  - anaconda3/share
+  - .local/share/Trash
+  - .local/share/flatpak
+  - .mozilla/firefox
+  - system
+  - system-inventory
+  - .claude/plugins/cache
+  - .claude/plugins/marketplaces
+  - .claude/skills
+  - .claude/agents
+  - .claude/commands
+  - .cursor/extensions
+  - .vscode/extensions
+  - .config/discord
+  - snap
+  project_signals:
+  - .git
+  - package.json
+  - pyproject.toml
+  - setup.py
+  - setup.cfg
+  - requirements.txt
+  - Cargo.toml
+  - go.mod
+  - pubspec.yaml
+  - Gemfile
+  - composer.json
+  - flake.nix
+  - shell.nix
+  - mix.exs
+  - build.gradle
+  - build.gradle.kts
+  - settings.gradle
+  - settings.gradle.kts
+  - pom.xml
+  - CMakeLists.txt
+  - Makefile
+  - deno.json
+  - bun.lockb
+  max_depth: 8
+place_classifier:
+  known_places:
+    .config: config
+    .gitconfig: config
+    .bashrc: config
+    .profile: config
+    .bash_logout: config
+    .vscode: editor-config
+    .cursor: editor-config
+    .cursor-tutor: editor-config
+    .claude: agent-config
+    .claude.json: agent-config
+    .honcho: agent-config
+    .local: config-and-data-mixed
+    .mozilla: browser-data
+    .ssh: secrets-keyring
+    .gnupg: secrets-keyring
+    .pki: secrets-keyring
+    signal-desktop-keyring.gpg: secrets-keyring
+    .bitmonero: crypto-wallet-data
+    Monero: crypto-wallet-data
+    .shared-ringdb: crypto-wallet-data
+    .kaspa: crypto-wallet-data
+    .kaspad: crypto-wallet-data
+    .kdx: crypto-wallet-data
+    .aws: cloud-tooling
+    .cdk: cloud-tooling
+    .supabase: cloud-tooling
+    Documents: personal-data
+    Pictures: personal-data
+    Music: personal-data
+    Videos: personal-data
+    Desktop: personal-data-or-scratch
+    Public: personal-data-or-scratch
+    Templates: personal-data-or-scratch
+    Downloads: scratch
+    .cache: cache
+    .npm: cache
+    .gradle: cache
+    .docker: cache
+    .var: cache
+    .nv: cache
+    .crawl4ai: cache
+    anaconda3: language-toolchain
+    .conda: language-toolchain
+    .nvm: language-toolchain
+    .npm-global: language-toolchain
+    .bun: language-toolchain
+    .pub-cache: language-toolchain
+    .java: language-toolchain
+    .openjfx: language-toolchain
+    .flutter: language-toolchain
+    .dart-tool: language-toolchain
+    .dartServer: language-toolchain
+    .android: vendored-tooling
+    Android: vendored-tooling
+    .icons: theme-data
+    .themes: theme-data
+    gnome-prism: theme-data
+    # gnome-prism-rollback-<timestamp>: theme-data  # add versioned rollback dirs if present on your machine
+    system: system-output
+    system-inventory: system-output
+categories:
+  language-toolchain:
+    description: Compilers, runtimes, language version managers (Python/Node/Rust/Dart/Java/Bun).
+    migrate_strategy: reinstall-from-spec
+  config:
+    description: Application configuration, dotfiles, structured user prefs.
+    migrate_strategy: chezmoi
+  agent-config:
+    description: Per-agent runtime config (~/.claude, ~/.honcho, etc).
+    migrate_strategy: chezmoi
+  editor-config:
+    description: IDE state, settings, extensions (VS Code, Cursor).
+    migrate_strategy: chezmoi
+  browser-data:
+    description: Browser profiles + caches mixed.
+    migrate_strategy: selective-profile
+  secrets-keyring:
+    description: SSH/GPG/age keys and app keyrings. Never in plain backups.
+    migrate_strategy: secure-channel
+  crypto-wallet-data:
+    description: Cryptocurrency wallet state and chain data (Monero, Kaspa, etc).
+      Sensitive; the seed phrase is the source of truth, not these files.
+    migrate_strategy: secure-channel-or-resync
+  cloud-tooling:
+    description: Cloud/infra CLI config and credentials (AWS, CDK, Supabase). Usually
+      holds tokens.
+    migrate_strategy: secure-channel
+  personal-data:
+    description: Irreplaceable user files (docs, photos, music, video).
+    migrate_strategy: restic
+  personal-data-or-scratch:
+    description: Often a mix; needs human triage (Desktop, Public, Templates).
+    migrate_strategy: manual-triage
+  scratch:
+    description: Working files, downloads. Most regenerable.
+    migrate_strategy: manual-triage
+  cache:
+    description: Regenerable. Skip on migrate.
+    migrate_strategy: skip
+  vendored-tooling:
+    description: Tool installs that ship binaries (Android SDK, etc.).
+    migrate_strategy: reinstall-from-spec
+  package-manager-data:
+    description: Snap / flatpak / etc data. Reinstall, don't copy.
+    migrate_strategy: reinstall-from-spec
+  config-and-data-mixed:
+    description: "Like ~/.local/share \u2014 needs per-subdir classification."
+    migrate_strategy: selective
+  theme-data:
+    description: GTK/icon themes, custom theme installs (e.g. gnome-prism). Re-installable
+      from source repo.
+    migrate_strategy: reinstall-from-spec
+  system-output:
+    description: "This tool's OWN output (~/system) plus sibling inventory dumps.\
+      \ Do not classify, do not migrate \u2014 it regenerates from the source tree."
+    migrate_strategy: skip
