@@ -1,3 +1,13 @@
+```
+ _                     _
+| |__   ___  _ __ ___ (_)_ __   __ _
+| '_ \ / _ \| '_ ` _ \| | '_ \ / _` |
+| | | | (_) | | | | | | | | | | (_| |
+|_| |_|\___/|_| |_| |_|_|_| |_|\__, |
+                               |___/
+·  ·    laptop  →  agent-legible  ·  ·
+```
+
 # homing
 
 > An agent harness for laptop migration, dev-environment legibility, and personal-document triage.
@@ -24,7 +34,8 @@ The agent's first move should be to read `BOOTSTRAP.md` and ask which mode you'r
 
 - **A — Leaving** this machine: generate a bundle to take to the next one.
 - **B — Arriving** at this machine: apply a bundle that's on a USB.
-- **C — Just exploring**: map the current laptop, no migration.
+- **C — Maintenance**: refresh the existing system on this machine (re-run rules, draft missing AGENT.md, re-triage a folder). No migration.
+- **D — Just exploring**: map the laptop with no migration and no manifest churn.
 
 ## Why
 
@@ -55,7 +66,7 @@ pip install -e .
 homing enumerate                  # walk $HOME, classify into a worklist
 homing summary                    # 5-minute readable overview, no LLM
 homing rules                      # deterministic classification (most units done here)
-homing classify --remaining       # LLM only on the leftovers
+homing classify --via-orchestrator # LLM only on the leftovers (uses Claude Code subagents)
 homing draft --batch              # generate AGENT.md / PLACE.md for confirmed units
 homing validate --all             # fresh-agent test against every manifest
 homing index                      # aggregate frontmatter → index.json

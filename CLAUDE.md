@@ -2,7 +2,7 @@
 
 Agent contract for **working on the `homing` repository itself** — i.e. you are an agent helping the user develop, test, or change `homing`'s code.
 
-> **If you are an agent running migration work for a user (clone + claude pattern), this is not your file. Read [BOOTSTRAP.md](./BOOTSTRAP.md) instead.** That doc walks through the three modes (leaving / arriving / exploring) and tells you what to do.
+> **If you are an agent running migration work for a user (clone + claude pattern), this is not your file. Read [BOOTSTRAP.md](./BOOTSTRAP.md) instead.** That doc walks through the four modes (leaving / arriving / maintenance / exploring) and tells you what to do.
 
 The rest of this file is about contributing to the codebase.
 
@@ -69,14 +69,29 @@ src/homing/
 │   ├── __init__.py
 │   ├── base.py        Rule base class + registration
 │   └── *.py           Each file = one rule
-├── classify.py        Phase D — LLM dispatch for low-confidence units
+├── classify.py        Phase D — LLM dispatch (currently a stub; the working
+│                      path is `--via-orchestrator` which writes request bundles
+│                      to `~/system/draft-requests/` for the Claude Code session
+│                      to fan out subagents)
 ├── draft.py           Phase E — AGENT.md / PLACE.md generation
+├── draft_cli.py       Phase E CLI shim — exposes `homing draft` + `--via-orchestrator`
 ├── validate.py        Phase F — fresh-agent test runner
 ├── index.py           Phase G — frontmatter aggregation
 ├── worklist.py        SQLite-backed state across phases
 ├── orchestrator.py    Wave-based parallel dispatch
 ├── platform.py        Loads config/platforms/<os>.yaml
 └── cli.py             `homing` typer app
+
+src/cabinet/
+├── scan.py            Phase A — homogeneity scan over a folder tree
+├── classify.py        Phase B — deterministic + LLM classification (also has
+│                      `--via-orchestrator` which emits `~/cabinet/batches/`)
+├── triage.py          Phase C — write triage.md for the user to mark up
+├── reconcile.py       Phase D — read user's marked triage.md back into decisions
+├── planner.py         Phase E — build an ActionPlan from approved decisions
+├── undo.py            Phase F — apply with undo ledger; the chaos-test target
+├── worklist.py        SQLite worklist (separate schema from homing's)
+└── cli.py             `cabinet` typer app
 ```
 
 ## Output contract

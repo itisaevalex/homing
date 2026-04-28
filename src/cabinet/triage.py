@@ -344,6 +344,7 @@ def register_triage_command(app) -> None:  # pragma: no cover - thin wrapper
         system_dir: Path = typer.Option(
             None,
             "--system-dir",
+            "--output-dir",
             help="Where cabinet writes triage.md. Defaults to ~/cabinet/.",
         ),
     ) -> None:

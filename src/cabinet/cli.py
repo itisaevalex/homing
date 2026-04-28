@@ -7,10 +7,8 @@ apply, undo, query) are stubbed and will be filled in by other agents.
 from __future__ import annotations
 
 import json
-import sys
 from collections import Counter
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -18,7 +16,7 @@ from rich.table import Table
 
 from . import __version__
 from .enumerate import enumerate_paths
-from .homogeneity import HomogeneityScore, score_folder
+from .homogeneity import score_folder
 from .sampler import sample_files
 from .worklist import Worklist
 
@@ -42,7 +40,7 @@ def _version_callback(value: bool) -> None:
 
 @app.callback()
 def main(
-    version: Optional[bool] = typer.Option(
+    version: bool | None = typer.Option(
         None,
         "--version",
         callback=_version_callback,
@@ -346,8 +344,10 @@ def classify(
 
     console.print(f"[green]classified:[/green] {evaluated}   [yellow]unknown:[/yellow] {unknown}")
 
-    # --via-orchestrator: emit unknowns.json + batches/ for the orchestrator session
-    if via_orchestrator and unknown > 0:
+    # --via-orchestrator: always emit batches/ — even when 0 unknowns, an
+    # explicit empty batch tells the orchestrating Claude Code session "we're
+    # done here" instead of leaving it polling forever.
+    if via_orchestrator:
         wl = Worklist(db_path)
         try:
             still_unknown = []
@@ -381,12 +381,19 @@ def classify(
             )
             n_batches += 1
 
-        console.print(
-            f"[cyan]--via-orchestrator:[/cyan] wrote {len(still_unknown)} unknowns "
-            f"as {n_batches} batches of up to {batch_size} units to {batches_dir}\n"
-            f"[cyan]Next:[/cyan] the orchestrator should fan out subagents on each batch, "
-            f"then run 'cabinet ingest-findings --output-dir {output_dir}'."
-        )
+        if not still_unknown:
+            console.print(
+                f"[green]--via-orchestrator:[/green] 0 unknowns — every unit "
+                f"classified by deterministic rules. No subagent fan-out needed.\n"
+                f"[cyan]Next:[/cyan] proceed to 'cabinet triage'."
+            )
+        else:
+            console.print(
+                f"[cyan]--via-orchestrator:[/cyan] wrote {len(still_unknown)} unknowns "
+                f"as {n_batches} batches of up to {batch_size} units to {batches_dir}\n"
+                f"[cyan]Next:[/cyan] the orchestrator should fan out subagents on each batch, "
+                f"then run 'cabinet ingest-findings --output-dir {output_dir}'."
+            )
 
 
 @app.command(name="ingest-findings")
@@ -471,6 +478,17 @@ def ingest_findings(
                                 ev_items.append({"path": "(no path)", "reason": str(e)})
                     else:
                         ev_items = [{"path": "(no path)", "reason": str(ev_in)}]
+                    # Citation rule: every classification must cite at least
+                    # one path/reason. An empty evidence list is treated as a
+                    # subagent failure — flag for human review rather than
+                    # silently accepting an uncited classification.
+                    if not ev_items:
+                        ev_items = [{
+                            "path": "(subagent)",
+                            "reason": "no evidence supplied — manual review required",
+                        }]
+                        cid = "needs-human"
+                        conf = min(conf, 0.0)
                     wl.record_finding(
                         uid,
                         rule_name,

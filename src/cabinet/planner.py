@@ -112,12 +112,17 @@ def _dedupe_dest_for(unit_path: str, review_pile: Path, dedupe_group: str | None
 
 
 def _trash_dest_for(unit_path: str, review_pile: Path) -> str:
-    """Where to put a trashed item — flat under review_pile/trashed/."""
-    # Use the source's last-two path segments so collisions are rare and the
-    # user can still tell what it came from.
-    parts = Path(unit_path).parts
-    tail = "_".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
-    return str(review_pile / "trashed" / tail)
+    """Where to put a trashed item — flat under review_pile/trashed/.
+
+    Layout: ``<review_pile>/trashed/<sha8>_<basename>``. The 8-char hash of
+    the full source path disambiguates files that share a basename but live
+    in different parents (e.g. a ``README.md`` from each of three projects).
+    The basename is preserved as a suffix so the user can still recognise
+    what was trashed without grepping a manifest.
+    """
+    sha8 = _hash_prefix(unit_path, n=8)
+    name = Path(unit_path).name or "unnamed"
+    return str(review_pile / "trashed" / f"{sha8}_{name}")
 
 
 def build_plan(
@@ -349,6 +354,7 @@ def register_plan_command(app) -> None:  # pragma: no cover - thin wrapper
         system_dir: Path = typer.Option(
             None,
             "--system-dir",
+            "--output-dir",
             help="Cabinet system dir. Defaults to ~/cabinet/.",
         ),
         archive_root: Path = typer.Option(

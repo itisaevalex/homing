@@ -61,15 +61,21 @@ homing index                        # Phase G — aggregate frontmatter → JSON
 LLM-touching phases (no API key needed when inside Claude Code):
 ```bash
 homing summary                                  # Phase B — readable overview, deterministic
-homing draft <name> --via-orchestrator          # Phase E — emits draft request bundle
-# YOU (the orchestrator) read <system-dir>/draft-requests/<name>.json,
-# fire a sub-agent that drafts the AGENT.md, write to target_path.
-homing validate --all --via-orchestrator        # Phase F — emits validation requests
-# YOU fire sub-agents per request, write JSON results to <system-dir>/validate-results/.
+homing draft <name> --via-orchestrator          # Phase E — emits ~/system/draft-requests/<name>.json
+homing validate --all --via-orchestrator        # Phase F — emits ~/system/validate-requests/<name>.json per AGENT.md
 homing ingest-validations                       # persist results to worklist
 ```
 
-Standalone (with `ANTHROPIC_API_KEY`): same commands minus `--via-orchestrator`.
+**Fan-out pattern for `--via-orchestrator` (applies to every command above + cabinet classify):**
+
+The CLI doesn't single-shot to Anthropic; it writes JSON request bundles. YOU loop:
+
+1. List the bundle dir: e.g. `ls ~/system/draft-requests/*.json` or `~/system/validate-requests/*.json` or `~/cabinet/batches/batch-*.json`.
+2. For each file: read it, spawn a sub-agent with the embedded `user_message` (and `schema` for drafts). The sub-agent writes its output to the request's `target_path` / `result_path` field.
+3. Fan out in parallel — multiple Agent calls in one message, since each request is independent. Cap parallelism to the session's per-window subagent budget (typically 7).
+4. After all sub-agents complete, run the matching `ingest-*` command to persist findings to the worklist.
+
+Standalone (with `ANTHROPIC_API_KEY`): same commands minus `--via-orchestrator` and the CLI calls Anthropic itself.
 
 ### A.2 — personal documents (cabinet)
 
@@ -106,6 +112,29 @@ cabinet apply --confirmed --output-dir ~/cabinet
 
 Only after explicit "yes". Show the undo ledger ID. If the user later regrets anything: `cabinet undo <id>`.
 
+### A.2.5 — browser profiles + personal-data piles (optional but usually wanted)
+
+Run BEFORE bundle generation, after asking the user to close every browser:
+
+```bash
+cd "$HOMING"
+./scripts/pack-browsers.sh ~/migration-extras/browsers/
+./scripts/pack-personal.sh ~/migration-extras/personal/
+```
+
+`pack-browsers.sh`:
+- Aborts (not just warns) if it detects a running browser — open profiles produce inconsistent SQLite snapshots that may be unrecoverable.
+- Captures Firefox, Chromium-family, and Cursor profile trees (cookies, sessions, encrypted password DB included).
+- Emits portable fallbacks per profile: `<profile>.bookmarks.html` (Firefox) / `.bookmarks.json` (Chromium), `<profile>.tabs.json`, `<profile>.history.json`. Use these on the target machine if profile-tree restoration fails for any reason.
+- Output dir is `chmod 700` from creation; treat it as you would your password vault. Move to encrypted storage before leaving the machine.
+
+`pack-personal.sh`:
+- Bulk byte-mover. Default targets are `~/Documents`, `~/Pictures`, `~/Music`, `~/Videos`, `~/Desktop`.
+- Excludes caches, `node_modules`, `.venv`, `__pycache__`, etc.
+- After cabinet has triaged stuff into archive/review piles, point this at the cleaned tree (`~/cabinet-archive/`) instead of raw `~/Documents`.
+
+These outputs sit alongside the homing bundle. They are NOT included in `bundle.sh`'s output by design — large + sensitive + better stored on a separate encrypted volume.
+
 ### A.3 — bundle generation
 
 ```bash
@@ -128,7 +157,7 @@ Always remind the user:
 - `~/.ssh/id_*` — SSH keys
 - `~/.gnupg/` — GPG keys
 - `~/.aws/credentials` — AWS profiles
-- `bundle.key` (if used keyfile mode for age) — DECRYPTS THE BUNDLE; carry on a SECOND USB
+- bundle passphrase (the age phrase used to encrypt `secrets.tar.gz.age`) — keep in your password manager, or split with the bundle USB on a second device
 - Tailscale auth key (from password manager)
 
 ---
@@ -142,13 +171,16 @@ Goal: restore the dev environment from a bundle, then optionally execute cabinet
 ```bash
 cd ~/path/to/migration-bundle-*
 sha256sum -c MANIFEST.txt           # integrity check first
-BUNDLE_KEY=/path/to/bundle.key bash setup.sh  # or passphrase mode if that's how the bundle was made
+bash setup.sh                       # prompts once for the age passphrase
 ```
 
 After setup completes, **do not auto-source the new bashrc in the current session** — tell the user to open a fresh shell. Verify in fresh shell:
 
 ```bash
-env | grep -E 'STRIPE|SUPABASE|RESEND|FIRECRAWL' | wc -l   # should be ≥6
+# Non-zero is the only requirement. Don't pin a magic number — ask the user how
+# many env vars they expect, then compare. Counts depend on what was in
+# secrets/api-keys.env on the source.
+env | grep -cE 'STRIPE|SUPABASE|RESEND|FIRECRAWL'
 ls ~/.claude/agents | wc -l                                # should match source count
 ```
 

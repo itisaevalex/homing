@@ -316,6 +316,7 @@ def register_reconcile_command(app) -> None:  # pragma: no cover - thin wrapper
         system_dir: Path = typer.Option(
             None,
             "--system-dir",
+            "--output-dir",
             help="Cabinet system dir (where triage.md lives). Defaults to ~/cabinet/.",
         ),
         triage: Path = typer.Option(

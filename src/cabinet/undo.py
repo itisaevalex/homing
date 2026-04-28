@@ -121,23 +121,50 @@ def _hash_file(p: Path) -> str:
 def _hash_dir_tree(p: Path) -> str:
     """Hash a directory's content deterministically.
 
-    Walk, sort, and hash each file's relative path + sha256. Mode and mtime
-    are not included (they're part of the per-file fingerprint when the dir
-    is reconstructed). This is good enough to detect "is this the same set
-    of files with the same content" for the chaos test.
+    Symlink policy: NEVER follow. A symlink contributes its target string
+    (no recursion through it) regardless of whether it points at a file or
+    a dir. This makes the hash invariant under same-FS ``os.rename`` AND
+    cross-FS ``shutil.copytree(symlinks=True)`` — both preserve symlinks
+    as symlinks, neither resolves them.
+
+    Each entry is recorded with an explicit type prefix so a regular file
+    that happens to contain a symlink-shaped string never collides with a
+    real symlink at the same path. Mode and mtime are excluded — those are
+    captured per-entry in ``_fingerprint`` if needed.
     """
     h = hashlib.sha256()
     files: list[tuple[str, str]] = []
-    for entry in sorted(p.rglob("*")):
-        if entry.is_symlink():
-            # Symlinks: hash their target string.
+    # os.walk(followlinks=False) is the explicit, deterministic, non-following
+    # traversal — pathlib.rglob's symlink behavior changed across Python
+    # versions and we don't want our hash depending on which interpreter ran.
+    for root, dirs, filenames in os.walk(p, followlinks=False):
+        root_path = Path(root)
+        # Sort so traversal order is deterministic.
+        dirs.sort()
+        filenames.sort()
+        # Pull symlinked dirs out of the walk so we DON'T recurse into them;
+        # record them as symlink entries instead.
+        kept_dirs: list[str] = []
+        for name in dirs:
+            entry = root_path / name
+            if entry.is_symlink():
+                rel = entry.relative_to(p).as_posix()
+                target = os.readlink(entry)
+                files.append((rel, f"symlink:{target}"))
+            else:
+                kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in filenames:
+            entry = root_path / name
             rel = entry.relative_to(p).as_posix()
-            target = os.readlink(entry)
-            files.append((rel, f"symlink:{target}"))
-            continue
-        if entry.is_file():
-            rel = entry.relative_to(p).as_posix()
-            files.append((rel, _hash_file(entry)))
+            if entry.is_symlink():
+                target = os.readlink(entry)
+                files.append((rel, f"symlink:{target}"))
+            elif entry.is_file():
+                files.append((rel, f"file:{_hash_file(entry)}"))
+            # Special files (sockets, fifos, devices) don't migrate;
+            # silently ignore them.
+    files.sort()
     for rel, ch in files:
         h.update(rel.encode("utf-8"))
         h.update(b"\x00")
@@ -147,10 +174,19 @@ def _hash_dir_tree(p: Path) -> str:
 
 
 def _fingerprint(path: Path) -> FileFingerprint:
-    """Snapshot a file or directory's pre/post-action state."""
+    """Snapshot a file or directory's pre/post-action state.
+
+    A path that is itself a symlink is recorded as a symlink (target string),
+    not by following it — same policy as ``_hash_dir_tree``.
+    """
     st = path.lstat()
-    is_dir = stat_mod.S_ISDIR(st.st_mode)
-    if is_dir:
+    is_link = stat_mod.S_ISLNK(st.st_mode)
+    is_dir = (not is_link) and stat_mod.S_ISDIR(st.st_mode)
+    if is_link:
+        # Don't follow — the symlink itself is the unit being moved.
+        ch = f"symlink:{os.readlink(path)}"
+        size = st.st_size
+    elif is_dir:
         ch = _hash_dir_tree(path)
         size = 0
     else:
@@ -200,16 +236,37 @@ def _safe_move(source: Path, dest: Path) -> None:
 
     Contract:
       - ``dest`` must NOT exist (caller guarantees; we re-check).
-      - Same FS: atomic ``os.rename``.
+      - Same FS: ``os.link`` + ``os.unlink`` (or rename for dirs/links).
       - Cross FS: copy-tree → verify content_hash → remove source.
       - On any failure, source is left intact.
+
+    TOCTOU note: POSIX ``rename`` silently overwrites an existing destination,
+    so the ``dest.exists()`` check has a race window where a concurrent writer
+    could create ``dest`` between the check and the rename. For files on the
+    same FS we close that window with ``os.link`` (fails atomically with
+    ``EEXIST`` if dest already exists). For directories and symlinks ``link``
+    isn't applicable — we re-check immediately before rename to narrow the
+    window to a few syscalls; full atomicity there would need ``renameat2``
+    which Python doesn't expose.
     """
-    if dest.exists():
+    if os.path.lexists(dest):
         raise ApplyAbort(f"destination already exists: {dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if _same_filesystem(source, dest):
-        # Atomic rename — single syscall, no copy.
+        # Same-FS files: hardlink + unlink for atomic no-overwrite.
+        if source.is_file() and not source.is_symlink():
+            try:
+                os.link(source, dest)
+            except FileExistsError as exc:
+                raise ApplyAbort(
+                    f"destination created by concurrent writer: {dest}"
+                ) from exc
+            os.unlink(source)
+            return
+        # Dirs and symlinks: re-check then rename. Narrow but non-zero TOCTOU.
+        if os.path.lexists(dest):
+            raise ApplyAbort(f"destination created concurrently: {dest}")
         os.rename(source, dest)
         return
 
@@ -572,7 +629,9 @@ def register_apply_command(app) -> None:  # pragma: no cover - thin wrapper
             False, "--confirmed", help="Required: explicit confirmation that you reviewed the plan."
         ),
         plan: Path = typer.Option(None, "--plan", help="Path to a plan-*.json file."),
-        system_dir: Path = typer.Option(None, "--system-dir", help="Cabinet system dir."),
+        system_dir: Path = typer.Option(
+            None, "--system-dir", "--output-dir", help="Cabinet system dir."
+        ),
     ) -> None:
         """Apply a plan with full undo logging. Refuses without --confirmed."""
         if not confirmed:
@@ -610,7 +669,9 @@ def register_undo_command(app) -> None:  # pragma: no cover - thin wrapper
     @app.command("undo")
     def undo_cmd(
         ledger_id: str = typer.Argument(..., help="Ledger id to reverse (e.g. undo-1700000000)."),
-        system_dir: Path = typer.Option(None, "--system-dir", help="Cabinet system dir."),
+        system_dir: Path = typer.Option(
+            None, "--system-dir", "--output-dir", help="Cabinet system dir."
+        ),
     ) -> None:
         """Reverse a previously applied plan from its undo ledger."""
         sys_dir = Path(system_dir) if system_dir else _plat.default_system_dir()

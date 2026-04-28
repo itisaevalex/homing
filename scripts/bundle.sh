@@ -42,14 +42,26 @@ echo "[1/5] chezmoi archive..."
 
 # 2. secrets — tar then age-encrypt with passphrase
 SECRETS_SRC="$HOME/.config/secrets"
+SECRETS_PLAIN="$OUT/.secrets-plain.tar.gz"
+# Trap ensures the plaintext tarball is destroyed even on Ctrl-C at the age
+# passphrase prompt or any unexpected failure. Without this, an interrupt
+# leaves cleartext secrets sitting on the migration media.
+_cleanup_plain() {
+  if [ -f "$SECRETS_PLAIN" ]; then
+    shred -u "$SECRETS_PLAIN" 2>/dev/null || rm -f "$SECRETS_PLAIN"
+  fi
+}
+trap _cleanup_plain EXIT INT TERM HUP
 if [ -d "$SECRETS_SRC" ]; then
   echo "[2/5] secrets: tar + age-encrypt (you will be prompted for a passphrase)..."
-  tar czf "$OUT/.secrets-plain.tar.gz" -C "$HOME/.config" secrets/
-  "$AGE" --passphrase --output "$OUT/secrets.tar.gz.age" "$OUT/.secrets-plain.tar.gz"
-  shred -u "$OUT/.secrets-plain.tar.gz" 2>/dev/null || rm -f "$OUT/.secrets-plain.tar.gz"
+  # Create the plaintext tarball with mode 600 from the start.
+  ( umask 077 && tar czf "$SECRETS_PLAIN" -C "$HOME/.config" secrets/ )
+  "$AGE" --passphrase --output "$OUT/secrets.tar.gz.age" "$SECRETS_PLAIN"
+  _cleanup_plain
 else
   echo "[2/5] no $SECRETS_SRC — skipping secrets"
 fi
+trap - EXIT INT TERM HUP
 
 # 3. homing system output (optional — only if it exists)
 if [ -d "$HOME/system" ]; then
@@ -111,12 +123,29 @@ fi
 # 3. Decrypt secrets (will prompt for passphrase)
 if [ -f "$HERE/secrets.tar.gz.age" ]; then
   echo "[3/5] decrypting secrets (you will be prompted for the bundle passphrase)..."
-  age -d -o /tmp/secrets-plain.tar.gz "$HERE/secrets.tar.gz.age"
+  # Per-user tmp so a multi-user box doesn't expose plaintext on /tmp.
+  SECRETS_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/migrate-secrets.XXXXXX")
+  chmod 700 "$SECRETS_TMPDIR"
+  SECRETS_PLAIN="$SECRETS_TMPDIR/secrets-plain.tar.gz"
+  _cleanup_secrets() {
+    if [ -f "$SECRETS_PLAIN" ]; then
+      shred -u "$SECRETS_PLAIN" 2>/dev/null || rm -f "$SECRETS_PLAIN"
+    fi
+    rm -rf "$SECRETS_TMPDIR" 2>/dev/null || true
+  }
+  trap _cleanup_secrets EXIT INT TERM HUP
+  ( umask 077 && age -d -o "$SECRETS_PLAIN" "$HERE/secrets.tar.gz.age" )
   mkdir -p "$HOME/.config"
-  tar xzf /tmp/secrets-plain.tar.gz -C "$HOME/.config/"
-  shred -u /tmp/secrets-plain.tar.gz 2>/dev/null || rm -f /tmp/secrets-plain.tar.gz
-  chmod 700 "$HOME/.config/secrets"
-  chmod 600 "$HOME/.config/secrets/"*
+  tar xzf "$SECRETS_PLAIN" -C "$HOME/.config/"
+  _cleanup_secrets
+  trap - EXIT INT TERM HUP
+  # Recursive permissions: dirs 700, files 600. The previous glob `*` skipped
+  # dotfiles and didn't recurse into nested config trees.
+  if [ -d "$HOME/.config/secrets" ]; then
+    chmod 700 "$HOME/.config/secrets"
+    find "$HOME/.config/secrets" -type d -exec chmod 700 {} +
+    find "$HOME/.config/secrets" -type f -exec chmod 600 {} +
+  fi
 else
   echo "[3/5] no secrets.tar.gz.age in bundle — skipping secrets"
 fi

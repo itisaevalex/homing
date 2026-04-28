@@ -13,10 +13,9 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 SCHEMA_VERSION = 1
 
@@ -196,7 +195,7 @@ class Worklist:
         meta_json = json.dumps(meta, sort_keys=True)
         now = _now()
         with self._conn:
-            cur = self._conn.execute(
+            self._conn.execute(
                 """
                 INSERT INTO units(kind, path, status, metadata_json, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -287,6 +286,7 @@ class Worklist:
                     _now(),
                 ),
             )
+            assert cur.lastrowid is not None, "INSERT did not produce lastrowid"
             return int(cur.lastrowid)
 
     def findings_for(self, unit_id: int) -> list[Finding]:
@@ -315,6 +315,7 @@ class Worklist:
                 """,
                 (unit_id, action, json.dumps(payload or {}, sort_keys=True), _now()),
             )
+            assert cur.lastrowid is not None, "INSERT did not produce lastrowid"
             return int(cur.lastrowid)
 
     def decisions_for(self, unit_id: int) -> list[Decision]:
@@ -333,6 +334,7 @@ class Worklist:
                 "INSERT INTO runs(phase, started_at, summary_json) VALUES (?, ?, ?)",
                 (phase, _now(), "{}"),
             )
+            assert cur.lastrowid is not None, "INSERT did not produce lastrowid"
             return int(cur.lastrowid)
 
     def end_run(self, run_id: int, *, summary: dict[str, Any] | None = None) -> None:
@@ -376,6 +378,7 @@ class Worklist:
                 """,
                 (run_id, unit_id, kind, json.dumps(payload or {}, sort_keys=True), _now()),
             )
+            assert cur.lastrowid is not None, "INSERT did not produce lastrowid"
             return int(cur.lastrowid)
 
     def events_for_run(self, run_id: int) -> list[dict[str, Any]]:
@@ -476,7 +479,7 @@ class Worklist:
                 classification=classification,
                 confidence=confidence,
                 evidence_source=evidence_source,
-                evidence_notes=evidence_notes,
+                evidence_notes=tuple(evidence_notes),
                 file_count=file_count,
                 total_size=total_size,
                 date_range=date_range,
@@ -494,7 +497,11 @@ class Worklist:
         """
         written = 0
         for d in decisions:
-            unit = self.unit_by_path("folder", d.unit_path) or self.unit_by_path("file", d.unit_path)
+            unit = (
+                self.unit_by_path("folder", d.unit_path)
+                or self.unit_by_path("file", d.unit_path)
+                or self.unit_by_path("duplicate-pair", d.unit_path)
+            )
             if unit is None:
                 self.event(
                     "decision-orphan",

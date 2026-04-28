@@ -197,7 +197,9 @@ def register_draft_command(app: typer.Typer) -> None:
         ),
     ) -> None:
         if via_orchestrator:
-            code = _run_draft_via_orchestrator(name, system_dir, project_path, policy)
+            code = _run_draft_via_orchestrator(
+                name, system_dir, project_path, policy, model
+            )
         else:
             code = _run_draft(name, system_dir, model, policy, project_path)
         raise typer.Exit(code=code)
@@ -208,6 +210,7 @@ def _run_draft_via_orchestrator(
     system_dir: Path,
     project_path: Optional[Path],
     policy: str,
+    model: str = _DEFAULT_MODEL,
 ) -> int:
     """Emit a draft request bundle for the orchestrator to handle, then exit."""
     import json
@@ -215,11 +218,16 @@ def _run_draft_via_orchestrator(
 
     system_dir = system_dir.expanduser().resolve()
 
-    # Resolve project path (worklist lookup or explicit override)
+    # Resolve project path (worklist lookup or explicit override). The lookup
+    # raises ``typer.BadParameter`` (not ``FileNotFoundError``) — catch the
+    # actual exception type so we don't leak a raw traceback to the user.
     if project_path is None:
         try:
             project_path = _project_path_for(name, system_dir)
-        except FileNotFoundError as exc:
+        except typer.BadParameter as exc:
+            _console.print(f"[red]error:[/red] {exc.message}")
+            return 2
+        except (FileNotFoundError, OSError) as exc:
             _console.print(f"[red]error:[/red] {exc}")
             return 2
     project_path = project_path.expanduser().resolve()
@@ -245,8 +253,16 @@ def _run_draft_via_orchestrator(
         _console.print(f"[red]error collecting inputs:[/red] {exc}")
         return 2
 
-    schema_text = _draft_mod._load_schema_text()
-    user_msg = _draft_mod._build_user_message(project_path, inputs)
+    try:
+        schema_text = _draft_mod._load_schema_text()
+    except Exception as exc:
+        _console.print(f"[red]error loading schema:[/red] {exc}")
+        return 2
+    try:
+        user_msg = _draft_mod._build_user_message(project_path, inputs)
+    except Exception as exc:
+        _console.print(f"[red]error building user message:[/red] {exc}")
+        return 2
 
     requests_dir = system_dir / "draft-requests"
     requests_dir.mkdir(parents=True, exist_ok=True)
@@ -261,11 +277,14 @@ def _run_draft_via_orchestrator(
                 "user_message": user_msg,
                 "input_files": [str(f.path) for f in inputs],
                 "policy": policy,
+                "model": model,
                 "instructions": (
                     "You are the orchestrator. Spawn a sub-agent and pass it the user_message + schema. "
                     "The sub-agent should produce a complete AGENT.md (frontmatter + body) following the "
                     "schema, citing the listed input_files in meta.sources. Write the result to target_path. "
-                    "Do NOT overwrite target_path if it exists — the policy already resolved this."
+                    "Do NOT overwrite target_path if it exists — the policy already resolved this. "
+                    "The 'model' field is the suggested model for this draft; the orchestrator may "
+                    "pick a different one based on its session config."
                 ),
             },
             indent=2,

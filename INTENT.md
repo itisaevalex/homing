@@ -17,7 +17,7 @@ A user who has run `homing` should be able to answer, in seconds, questions they
 1. `homing enumerate` produces `enumeration.json` covering the entire `$HOME` accessible to the user, classified into project / place / cache-skip / unclear.
 2. `homing summary` produces `overview.md` — readable in 5 minutes, no LLM, single artifact that lets the user decide whether to continue.
 3. `homing rules` runs deterministic rule plugins; >70% of units classified without LLM.
-4. `homing classify --remaining` resolves the rest with bounded LLM dispatch.
+4. `homing classify --via-orchestrator` resolves the rest by emitting batches for the orchestrating Claude Code session to fan out subagents on (or `homing classify` standalone if `ANTHROPIC_API_KEY` is set).
 5. `homing draft <name>` produces an AGENT.md or PLACE.md with citations.
 6. `homing validate <name>` confirms the manifest passes a fresh-agent test (≥7/10 confidence).
 7. `homing index` aggregates all manifests into `index.json`.

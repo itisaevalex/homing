@@ -372,7 +372,7 @@ def validate(
     ),
 ) -> None:
     if via_orchestrator:
-        return _validate_via_orchestrator(name, all_units, system_dir)
+        return _validate_via_orchestrator(name, all_units, system_dir, model)
     if all_units and name is not None:
         _console.print(
             "[red]error:[/] pass either a unit name OR --all, not both."
@@ -773,6 +773,7 @@ def _validate_via_orchestrator(
     name: Optional[str],
     all_units: bool,
     system_dir: Path,
+    model: str = _DEFAULT_VALIDATE_MODEL,
 ) -> None:
     """Emit validation request files for the orchestrator to handle."""
     import json as _json
@@ -814,12 +815,14 @@ def _validate_via_orchestrator(
             "user_message": user_msg,
             "questions": dict(validate_module.QUESTIONS),
             "result_path": str(results_dir / f"{unit_name}.json"),
+            "model": model,
             "instructions": (
                 "You are the orchestrator. Spawn a fresh sub-agent that has NOT seen this "
                 "project before. Pass it the user_message verbatim. The sub-agent must answer "
                 "every question and emit a JSON object with: confidence_score (1-10), "
                 "answers (dict keyed by question), wishlist (list of <=3 strings). "
-                "Write the JSON to result_path. Then run 'homing ingest-validations' to persist."
+                "Write the JSON to result_path. Then run 'homing ingest-validations' to persist. "
+                "The 'model' field is the suggested model; the orchestrator may pick a different one."
             ),
         }
         (requests_dir / f"{unit_name}.json").write_text(_json.dumps(request, indent=2))
@@ -854,12 +857,18 @@ def ingest_validations(
         raise typer.Exit(code=2)
 
     db_path = system_dir / "worklist.sqlite"
-    worklist: Optional[Worklist] = None
-    if db_path.is_file():
-        worklist = Worklist(db_path)
-        run_id = worklist.start_run("ingest-validations")
-    else:
-        run_id = None
+    # Hard-fail when the worklist is absent: silently exiting 0 here looks like
+    # success but persists nothing, which broke the audit trail. The user must
+    # run `homing enumerate` (or whichever command writes the worklist) first.
+    if not db_path.is_file():
+        _console.print(
+            f"[red]error:[/] no worklist at {db_path}. "
+            f"Run 'homing enumerate' first so we have units to attach findings to."
+        )
+        raise typer.Exit(code=2)
+
+    worklist = Worklist(db_path)
+    run_id = worklist.start_run("ingest-validations")
 
     written = 0
     failed = 0
@@ -876,28 +885,63 @@ def ingest_validations(
                 passed = score >= validate_module.PASS_THRESHOLD
                 answers = data.get("answers", {})
                 wishlist = data.get("wishlist", [])
-                if worklist is not None:
+                # Persist the full answers + wishlist alongside the score —
+                # the score alone loses the qualitative reasoning we asked the
+                # sub-agent to produce. Mirror the shape `_persist_validation`
+                # writes for the direct (non-orchestrator) path so consumers
+                # querying findings see one schema regardless of code path.
+                classifications = {
+                    "score": score,
+                    "pass": passed,
+                    "answers": answers,
+                    "wishlist": wishlist,
+                    "rationale": data.get("rationale", ""),
+                    "model": data.get("model", ""),
+                }
+                # The unit may not exist in the worklist yet (e.g. AGENT.md
+                # was hand-written for a project not yet enumerated). Probe
+                # first so we can attach an orphan event with name=None
+                # instead of triggering a KeyError cascade where the rescue
+                # path itself raises.
+                unit_exists = worklist.unit(unit_name) is not None
+                if unit_exists:
                     try:
                         worklist.record_finding(
                             unit_name,
                             rule="validate",
                             confidence=score / 10.0,
-                            classifications={"score": score, "pass": passed},
+                            classifications=classifications,
                             evidence=[
                                 {"path": str(f), "reason": "orchestrator validation result"}
                             ],
                         )
-                        try:
-                            if passed:
+                        if passed:
+                            try:
                                 worklist.update_status(unit_name, "validated")
-                        except Exception:
-                            pass
+                            except (KeyError, ValueError):
+                                # Race: unit deleted between probe and update,
+                                # or "validated" not in VALID_STATUSES on this
+                                # schema version. Non-fatal — finding is still
+                                # recorded.
+                                pass
                     except Exception as e:
+                        # Use name=None for the warn event so we don't recurse
+                        # into _unit_id_or_raise on a unit we've just shown
+                        # has issues.
                         worklist.event(
-                            unit_name=unit_name,
+                            name=None,
                             type="warn",
-                            message=f"ingest-validations: {e}",
+                            message=f"ingest-validations: {unit_name}: {e}",
                         )
+                else:
+                    worklist.event(
+                        name=None,
+                        type="orphan",
+                        message=(
+                            f"ingest-validations: result for {unit_name!r} but "
+                            f"no such unit in worklist (run 'homing enumerate'?)"
+                        ),
+                    )
                 if passed:
                     pass_n += 1
                 else:
@@ -906,17 +950,26 @@ def ingest_validations(
             except Exception as exc:
                 _console.print(f"[yellow]skip[/] {f.name}: {exc}")
                 failed += 1
-        if worklist is not None and run_id is not None:
-            worklist.end_run(run_id, exit_code=0, summary=f"ingested {written}, failed {failed}")
+        # Exit code reflects parse failures so callers (CI, the orchestrator)
+        # can distinguish "all clean" from "ingested some, but corrupt files
+        # need attention." Worklist persistence still happens for everything
+        # parseable.
+        run_exit_code = 1 if failed > 0 else 0
+        worklist.end_run(
+            run_id,
+            exit_code=run_exit_code,
+            summary=f"ingested {written}, failed {failed}",
+        )
     finally:
-        if worklist is not None:
-            worklist.close()
+        worklist.close()
 
     _console.print(
         f"[green]ingested:[/] {written}   "
         f"[bold]pass:[/] {pass_n}   [bold]fail:[/] {fail_n}   "
         f"[yellow]parse-errors:[/] {failed}"
     )
+    if failed > 0:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":  # pragma: no cover
