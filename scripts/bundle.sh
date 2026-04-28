@@ -108,6 +108,13 @@ if [ "${INCLUDE_CREDS:-0}" = "1" ]; then
   [ -d "$HOME/.aws" ] && CREDS_PATHS+=(.aws)
   [ -d "$HOME/.config/gh" ] && CREDS_PATHS+=(.config/gh)
   [ -f "$HOME/.docker/config.json" ] && CREDS_PATHS+=(.docker/config.json)
+  # NSS DB (browser/system cert store, may hold TLS client private keys) and
+  # Signal Desktop's local keyring (decrypts the message DB on a new machine).
+  # Both are credentials in everything but name; if INCLUDE_CREDS is on the
+  # user already accepted a creds bundle, no separate flag needed.
+  [ -d "$HOME/.pki" ] && CREDS_PATHS+=(.pki)
+  [ -f "$HOME/.config/Signal/config.json" ] && CREDS_PATHS+=(.config/Signal)
+  [ -f "$HOME/signal-desktop-keyring.gpg" ] && CREDS_PATHS+=(signal-desktop-keyring.gpg)
 
   if [ ${#CREDS_PATHS[@]} -gt 0 ]; then
     echo "[2b] creds: tar + age-encrypt (${CREDS_PATHS[*]})..."
@@ -130,6 +137,98 @@ if [ "${INCLUDE_CREDS:-0}" = "1" ]; then
     echo "[2b] INCLUDE_CREDS=1 but none of .ssh/.gnupg/.aws/.config/gh/.docker found — skipping"
   fi
   trap - EXIT INT TERM HUP
+fi
+
+# 2c. wallets bundle — opt-in via INCLUDE_WALLETS=1.
+# Crypto wallet keys are IRREPLACEABLE on chain — losing them = losing funds.
+# By default these are out-of-band per BOOTSTRAP.md (the user is expected to
+# carry seed phrases separately). Setting INCLUDE_WALLETS=1 ships them in a
+# dedicated wallets.tar.gz.age — same age recipient as secrets/creds. Use
+# this for trusted-channel transfers only; the failure mode of leaking this
+# bundle is unbounded.
+if [ "${INCLUDE_WALLETS:-0}" = "1" ]; then
+  WALLETS_PLAIN="$OUT/.wallets-plain.tar.gz"
+  _cleanup_wallets_plain() {
+    if [ -f "$WALLETS_PLAIN" ]; then
+      shred -u "$WALLETS_PLAIN" 2>/dev/null || rm -f "$WALLETS_PLAIN"
+    fi
+  }
+  trap _cleanup_wallets_plain EXIT INT TERM HUP
+
+  WALLET_PATHS=()
+  # Monero — actual wallet keyfiles + node SSL key (which ties identity to
+  # this node). Blockchain LMDB is regenerable but big; we include only if
+  # explicitly opted in via INCLUDE_WALLETS_BLOCKCHAIN=1.
+  [ -d "$HOME/Monero/wallets" ] && WALLET_PATHS+=(Monero/wallets)
+  if [ -d "$HOME/.bitmonero" ]; then
+    if [ "${INCLUDE_WALLETS_BLOCKCHAIN:-0}" = "1" ]; then
+      WALLET_PATHS+=(.bitmonero)
+    else
+      # SSL cert/key only — small, identity-bearing
+      [ -f "$HOME/.bitmonero/p2p_ssl.key" ] && WALLET_PATHS+=(.bitmonero/p2p_ssl.key)
+      [ -f "$HOME/.bitmonero/p2p_ssl.crt" ] && WALLET_PATHS+=(.bitmonero/p2p_ssl.crt)
+    fi
+  fi
+  [ -d "$HOME/.shared-ringdb" ] && [ "${INCLUDE_WALLETS_BLOCKCHAIN:-0}" = "1" ] \
+    && WALLET_PATHS+=(.shared-ringdb)
+  # Kaspa
+  [ -d "$HOME/.kaspa" ] && WALLET_PATHS+=(.kaspa)
+  [ -d "$HOME/.kdx" ] && WALLET_PATHS+=(.kdx)
+  # Other common wallet locations
+  [ -d "$HOME/.electrum" ] && WALLET_PATHS+=(.electrum)
+  [ -d "$HOME/.bitcoin" ] && [ "${INCLUDE_WALLETS_BLOCKCHAIN:-0}" = "1" ] \
+    && WALLET_PATHS+=(.bitcoin)
+  [ -d "$HOME/.ethereum/keystore" ] && WALLET_PATHS+=(.ethereum/keystore)
+
+  if [ ${#WALLET_PATHS[@]} -gt 0 ]; then
+    echo "[2c] wallets: tar + age-encrypt (${WALLET_PATHS[*]})..."
+    ( umask 077 && tar czf "$WALLETS_PLAIN" -C "$HOME" "${WALLET_PATHS[@]}" )
+    if [ "${BUNDLE_KEY_MODE:-passphrase}" = "key" ]; then
+      KEYFILE="$OUT/bundle.key"
+      if [ ! -f "$KEYFILE" ]; then
+        echo "error: BUNDLE_KEY_MODE=key but $KEYFILE missing" >&2
+        exit 1
+      fi
+      PUBKEY=$(grep '^# public key:' "$KEYFILE" | awk '{print $NF}')
+      "$AGE" -r "$PUBKEY" --output "$OUT/wallets.tar.gz.age" "$WALLETS_PLAIN"
+    else
+      echo "  (you will be prompted for the same passphrase used for secrets)"
+      "$AGE" --passphrase --output "$OUT/wallets.tar.gz.age" "$WALLETS_PLAIN"
+    fi
+    _cleanup_wallets_plain
+    echo "  WALLET BUNDLE CREATED — these keys are irreplaceable. Verify on destination BEFORE wiping the source."
+  else
+    echo "[2c] INCLUDE_WALLETS=1 but no known wallet locations found — skipping"
+  fi
+  trap - EXIT INT TERM HUP
+fi
+
+# 2d. extra personal dirs — opt-in via EXTRA_PERSONAL_DIRS env var.
+# Top-level $HOME project dirs that aren't under Documents/ get missed by
+# pack-personal.sh's defaults. This catches them as a sibling personal-extra/
+# tarball in the bundle (un-encrypted; it's source code, not secrets).
+# Format: colon-separated absolute or $HOME-relative paths.
+#   EXTRA_PERSONAL_DIRS="$HOME/gnome-prism:$HOME/system-inventory:$HOME/opensource-staging"
+if [ -n "${EXTRA_PERSONAL_DIRS:-}" ]; then
+  EXTRA_PATHS=()
+  IFS=':' read -ra _RAW_EXTRAS <<< "$EXTRA_PERSONAL_DIRS"
+  for p in "${_RAW_EXTRAS[@]}"; do
+    # Resolve to a path relative to $HOME for tar -C convenience.
+    p="${p/#~/$HOME}"
+    if [ -e "$p" ]; then
+      rel="${p#$HOME/}"
+      EXTRA_PATHS+=("$rel")
+    else
+      echo "  warning: EXTRA_PERSONAL_DIRS entry not found: $p"
+    fi
+  done
+  if [ ${#EXTRA_PATHS[@]} -gt 0 ]; then
+    echo "[2d] extras: tar (${EXTRA_PATHS[*]})..."
+    tar czf "$OUT/personal-extra.tar.gz" \
+        --exclude='node_modules' --exclude='.venv' --exclude='__pycache__' \
+        --exclude='.cache' --exclude='target' --exclude='dist' \
+        -C "$HOME" "${EXTRA_PATHS[@]}"
+  fi
 fi
 
 # 3. homing system output (optional — only if it exists)
@@ -254,6 +353,44 @@ if [ -f "$HERE/creds.tar.gz.age" ]; then
   done
   # Public-key files conventionally stay world-readable; restore that for .pub
   find "$HOME/.ssh" -name '*.pub' -type f -exec chmod 644 {} + 2>/dev/null || true
+fi
+
+# 3c. Decrypt + extract wallets bundle if shipped (opt-in INCLUDE_WALLETS=1).
+#     Crypto wallet keys are irreplaceable — verify decryption + presence
+#     before wiping the source.
+if [ -f "$HERE/wallets.tar.gz.age" ]; then
+  echo "[3c] decrypting + extracting wallets bundle..."
+  WALLETS_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/migrate-wallets.XXXXXX")
+  chmod 700 "$WALLETS_TMPDIR"
+  WALLETS_PLAIN="$WALLETS_TMPDIR/wallets-plain.tar.gz"
+  _cleanup_wallets() {
+    if [ -f "$WALLETS_PLAIN" ]; then
+      shred -u "$WALLETS_PLAIN" 2>/dev/null || rm -f "$WALLETS_PLAIN"
+    fi
+    rm -rf "$WALLETS_TMPDIR" 2>/dev/null || true
+  }
+  trap _cleanup_wallets EXIT INT TERM HUP
+  ( umask 077 && age "${AGE_DECRYPT_ARGS[@]}" -o "$WALLETS_PLAIN" "$HERE/wallets.tar.gz.age" )
+  tar xzf "$WALLETS_PLAIN" -C "$HOME/"
+  _cleanup_wallets
+  trap - EXIT INT TERM HUP
+  # Lock down wallet dirs — tar should preserve modes but be defensive.
+  for d in "$HOME/Monero" "$HOME/.kaspa" "$HOME/.kdx" "$HOME/.electrum" \
+           "$HOME/.bitcoin" "$HOME/.ethereum" "$HOME/.bitmonero" \
+           "$HOME/.shared-ringdb"; do
+    if [ -d "$d" ]; then
+      chmod 700 "$d"
+      find "$d" -type d -exec chmod 700 {} + 2>/dev/null
+      find "$d" -type f -exec chmod 600 {} + 2>/dev/null
+    fi
+  done
+  echo "  WALLET BUNDLE EXTRACTED — verify wallets open before wiping the source drive."
+fi
+
+# 3d. Extract personal-extra (top-level project dirs not under Documents/).
+if [ -f "$HERE/personal-extra.tar.gz" ]; then
+  echo "[3d] extracting personal-extra into \$HOME..."
+  tar xzf "$HERE/personal-extra.tar.gz" -C "$HOME/"
 fi
 
 # 4. Restore homing's system/ output if present

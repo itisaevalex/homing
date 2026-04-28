@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.table import Table
 
 from homing import __version__
+from homing import audit as audit_module
 from homing import enumerate as enumerate_module
 from homing import index as index_module
 from homing import orchestrator as orchestrator_module
@@ -168,6 +169,165 @@ def summary(
 ) -> None:
     out_path = summary_module.run(home=home, system_dir=system_dir)
     _console.print(f"[green]wrote[/] {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Phase B.5 — audit-coverage
+# ---------------------------------------------------------------------------
+
+
+@app.command(
+    name="audit-coverage",
+    help=(
+        "Walk $HOME and surface anything not covered by the default migration "
+        "channels (chezmoi / pack-personal / pack-browsers / secrets / creds / "
+        "wallets). With --via-orchestrator, spawns a sub-agent per uncovered "
+        "item to grade content (canonical/replaceable/regenerable/abandoned/"
+        "decide) and recommend an action."
+    ),
+)
+def audit_coverage(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="Output directory."
+    ),
+    home: Path = typer.Option(
+        _DEFAULT_HOME, "--home", help="Source directory to audit. Defaults to $HOME."
+    ),
+    via_orchestrator: bool = typer.Option(
+        False,
+        "--via-orchestrator",
+        help=(
+            "Defer the per-item agentic deep-dive to the orchestrating Claude "
+            "Code session. Writes one JSON request per uncovered item to "
+            "<system-dir>/audit-requests/, and the orchestrator fans out "
+            "sub-agents that write back to <system-dir>/audit-results/. After "
+            "fan-out, run 'homing ingest-audit'."
+        ),
+    ),
+) -> None:
+    system_dir = system_dir.expanduser().resolve()
+    home = home.expanduser().resolve()
+    if not home.is_dir():
+        _console.print(f"[red]error:[/] $HOME does not exist: {home}")
+        raise typer.Exit(code=2)
+
+    items = audit_module.audit_static(home)
+    md_path, json_path = audit_module.write_outputs(items, system_dir)
+
+    by_bucket: dict[str, int] = {}
+    uncovered_size = 0
+    for item in items:
+        by_bucket[item.bucket] = by_bucket.get(item.bucket, 0) + 1
+        if item.bucket == "uncovered":
+            uncovered_size += item.size_bytes
+
+    table = Table(title="audit-coverage", show_header=True, header_style="bold")
+    table.add_column("bucket")
+    table.add_column("count", justify="right")
+    for bucket in sorted(by_bucket, key=lambda b: -by_bucket[b]):
+        style = "yellow" if bucket == "uncovered" else None
+        table.add_row(bucket, str(by_bucket[bucket]), style=style)
+    _console.print(table)
+    _console.print(f"[green]wrote[/] {md_path}")
+    _console.print(f"[green]wrote[/] {json_path}")
+
+    if via_orchestrator:
+        uncovered_items = [i for i in items if i.bucket == "uncovered"]
+        requests_dir = system_dir / "audit-requests"
+        results_dir = system_dir / "audit-results"
+        requests_dir.mkdir(parents=True, exist_ok=True)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        for old in requests_dir.glob("*.json"):
+            old.unlink()
+        for item in uncovered_items:
+            req = audit_module.build_audit_request(item)
+            # File name from a hash of the path so weird chars don't break
+            # filesystems on the staging dir.
+            import hashlib
+            slug = hashlib.sha256(item.path.encode()).hexdigest()[:12]
+            (requests_dir / f"{slug}.json").write_text(
+                json.dumps(req, indent=2)
+            )
+        if not uncovered_items:
+            _console.print(
+                f"[green]--via-orchestrator:[/] 0 uncovered items — every "
+                f"$HOME entry maps to a known migration channel. No fan-out "
+                f"needed."
+            )
+        else:
+            _console.print(
+                f"[cyan]--via-orchestrator:[/] wrote "
+                f"{len(uncovered_items)} request(s) to {requests_dir}\n"
+                f"[cyan]Results expected at:[/] {results_dir}\n"
+                f"[cyan]Next:[/] orchestrator spawns sub-agents per request, "
+                f"writes <slug>.json results, then run "
+                f"'homing ingest-audit --system-dir {system_dir}'."
+            )
+
+
+@app.command(name="ingest-audit")
+def ingest_audit(
+    system_dir: Path = typer.Option(
+        _DEFAULT_SYSTEM_DIR, "--system-dir", help="System directory."
+    ),
+) -> None:
+    """Ingest agentic deep-dive results into coverage-audit.{md,json}.
+
+    Reads <system-dir>/audit-results/<slug>.json, merges grade /
+    content_class / recommended_action / notes back into the audit map,
+    and rewrites coverage-audit.{md,json}.
+    """
+    system_dir = system_dir.expanduser().resolve()
+    results_dir = system_dir / "audit-results"
+    json_path = system_dir / "coverage-audit.json"
+    if not results_dir.is_dir() or not json_path.is_file():
+        _console.print(
+            f"[red]error:[/] need both {results_dir}/ and {json_path}. "
+            f"Run 'homing audit-coverage --via-orchestrator' first."
+        )
+        raise typer.Exit(code=2)
+
+    raw = json.loads(json_path.read_text())
+    items = [audit_module.CoverageItem(**item) for item in raw]
+    by_path = {i.path: i for i in items}
+
+    import hashlib
+    updated: list[audit_module.CoverageItem] = []
+    skipped = 0
+    for item in items:
+        slug = hashlib.sha256(item.path.encode()).hexdigest()[:12]
+        result_file = results_dir / f"{slug}.json"
+        if not result_file.is_file():
+            updated.append(item)
+            continue
+        try:
+            data = json.loads(result_file.read_text())
+        except json.JSONDecodeError:
+            _console.print(f"[yellow]skip[/] {result_file.name}: unparseable")
+            skipped += 1
+            updated.append(item)
+            continue
+        # Merge agent fields onto the original item
+        from dataclasses import replace
+        updated.append(
+            replace(
+                item,
+                grade=data.get("grade"),
+                content_class=data.get("content_class"),
+                recommended_action=data.get("recommended_action"),
+                agent_notes=data.get("notes"),
+            )
+        )
+
+    md_path, json_path = audit_module.write_outputs(updated, system_dir)
+    enriched = sum(1 for i in updated if i.grade is not None)
+    _console.print(
+        f"[green]ingested:[/] {enriched} graded, "
+        f"[yellow]skipped:[/] {skipped} unparseable"
+    )
+    _console.print(f"[green]rewrote[/] {md_path}")
+    if skipped > 0:
+        raise typer.Exit(code=1)
 
 
 # ---------------------------------------------------------------------------
