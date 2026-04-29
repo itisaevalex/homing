@@ -231,6 +231,60 @@ if [ -n "${EXTRA_PERSONAL_DIRS:-}" ]; then
   fi
 fi
 
+# 2e. Claude Code session/conversation state — opt-in via INCLUDE_CLAUDE_STATE=1.
+# ~/.claude/projects/ holds per-project conversation history (every chat
+# Claude Code has had on this machine, organized by working directory).
+# chezmoi explicitly ignores this in dotfiles repos because it churns
+# constantly, so the dotfiles tarball misses it. For a real migration this
+# is canonical: 100s of MB of context that would otherwise be lost.
+# Encrypted because conversation history can include API keys, credentials,
+# and project secrets discussed in chat.
+if [ "${INCLUDE_CLAUDE_STATE:-0}" = "1" ]; then
+  CLAUDE_PLAIN="$OUT/.claude-state-plain.tar.gz"
+  _cleanup_claude_state() {
+    if [ -f "$CLAUDE_PLAIN" ]; then
+      shred -u "$CLAUDE_PLAIN" 2>/dev/null || rm -f "$CLAUDE_PLAIN"
+    fi
+  }
+  trap _cleanup_claude_state EXIT INT TERM HUP
+
+  CLAUDE_PATHS=()
+  for p in \
+      .claude/projects \
+      .claude/session-data \
+      .claude/sessions \
+      .claude/todos \
+      .claude/tasks \
+      .claude/plans \
+      .claude/history.jsonl \
+      .claude/bash-commands.log \
+      .claude/cost-tracker.log \
+      .claude/file-history; do
+    [ -e "$HOME/$p" ] && CLAUDE_PATHS+=("$p")
+  done
+
+  if [ ${#CLAUDE_PATHS[@]} -gt 0 ]; then
+    echo "[2e] claude-state: tar + age-encrypt (${#CLAUDE_PATHS[@]} paths)..."
+    ( umask 077 && tar czf "$CLAUDE_PLAIN" -C "$HOME" "${CLAUDE_PATHS[@]}" )
+    if [ "${BUNDLE_KEY_MODE:-passphrase}" = "key" ]; then
+      KEYFILE="$OUT/bundle.key"
+      if [ ! -f "$KEYFILE" ]; then
+        echo "error: BUNDLE_KEY_MODE=key but $KEYFILE missing" >&2
+        exit 1
+      fi
+      PUBKEY=$(grep '^# public key:' "$KEYFILE" | awk '{print $NF}')
+      "$AGE" -r "$PUBKEY" --output "$OUT/claude-state.tar.gz.age" "$CLAUDE_PLAIN"
+    else
+      echo "  (you will be prompted for the same passphrase used for secrets)"
+      "$AGE" --passphrase --output "$OUT/claude-state.tar.gz.age" "$CLAUDE_PLAIN"
+    fi
+    _cleanup_claude_state
+  else
+    echo "[2e] INCLUDE_CLAUDE_STATE=1 but no .claude/{projects,session-data,…} found — skipping"
+  fi
+  trap - EXIT INT TERM HUP
+fi
+
 # 3. homing system output (optional — only if it exists)
 if [ -d "$HOME/system" ]; then
   echo "[3/5] homing ~/system/ snapshot..."
@@ -391,6 +445,27 @@ fi
 if [ -f "$HERE/personal-extra.tar.gz" ]; then
   echo "[3d] extracting personal-extra into \$HOME..."
   tar xzf "$HERE/personal-extra.tar.gz" -C "$HOME/"
+fi
+
+# 3e. Decrypt + extract Claude Code session/conversation state.
+#     Restores ~/.claude/projects (per-project conversation history),
+#     session-data, sessions, todos, tasks, plans, history.jsonl.
+if [ -f "$HERE/claude-state.tar.gz.age" ]; then
+  echo "[3e] decrypting + extracting Claude Code state..."
+  CLAUDE_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/migrate-claude.XXXXXX")
+  chmod 700 "$CLAUDE_TMPDIR"
+  CLAUDE_PLAIN="$CLAUDE_TMPDIR/claude-plain.tar.gz"
+  _cleanup_claude() {
+    if [ -f "$CLAUDE_PLAIN" ]; then
+      shred -u "$CLAUDE_PLAIN" 2>/dev/null || rm -f "$CLAUDE_PLAIN"
+    fi
+    rm -rf "$CLAUDE_TMPDIR" 2>/dev/null || true
+  }
+  trap _cleanup_claude EXIT INT TERM HUP
+  ( umask 077 && age "${AGE_DECRYPT_ARGS[@]}" -o "$CLAUDE_PLAIN" "$HERE/claude-state.tar.gz.age" )
+  tar xzf "$CLAUDE_PLAIN" -C "$HOME/"
+  _cleanup_claude
+  trap - EXIT INT TERM HUP
 fi
 
 # 4. Restore homing's system/ output if present

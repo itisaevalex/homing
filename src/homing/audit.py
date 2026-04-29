@@ -109,6 +109,22 @@ REGENERABLE_PATTERNS: tuple[str, ...] = (
     ".dart-tool",
     # Editor swap files
     ".swp",
+    # Claude Code regenerables — chezmoi-ignored on the user's machine and
+    # also genuinely regenerable. Telemetry, caches, plugin downloads.
+    ".claude/cache",
+    ".claude/paste-cache",
+    ".claude/image-cache",
+    ".claude/shell-snapshots",
+    ".claude/telemetry",
+    ".claude/metrics",
+    ".claude/statsig",
+    ".claude/debug",
+    ".claude/downloads",
+    ".claude/backups",
+    ".claude/plugins",  # re-fetched from skill marketplace
+    ".claude/mcp-needs-auth-cache.json",
+    ".claude/session-env",  # ephemeral env per session
+    ".claude/marketplace.json",  # rebuilt on first session
     # Misc OS state — regenerable from system packages on the destination
     ".icons", ".themes", ".fonts",
     ".local/share/icons", ".local/share/themes", ".local/share/fonts",
@@ -135,8 +151,34 @@ REGENERABLE_PATTERNS: tuple[str, ...] = (
 # unrelated child items. The parent itself is suppressed from the top-level
 # walk — flagging "~/.local 22 GB uncovered" is misleading when all the real
 # units live one level deeper. Children are individually classified.
+#
+# ``.claude`` is in here for a subtle reason: chezmoi tracks the .claude
+# directory entry itself (visible in ``chezmoi managed``) plus a curated
+# subset of its children (agents/, commands/, etc.). But other children
+# are explicitly chezmoi-ignored (.claude/cache, .claude/projects) or just
+# not yet `chezmoi add`-ed (.claude/session-data, .claude/sessions). If we
+# treat .claude as a single chezmoi-managed unit and stop, we miss 773 MB
+# of conversation history. Walk its children.
 HIDDEN_DIRS_TO_INSPECT: tuple[str, ...] = (
-    ".config", ".local", ".local/share",
+    ".config", ".local", ".local/share", ".claude",
+)
+
+# Conversation/session/task state Claude Code writes under ~/.claude/.
+# These are NOT in any chezmoi tree (correctly — too churny for a dotfiles
+# git repo) and they ARE canonical user content (every conversation per
+# project, including ones the user wants to come along to a new machine).
+# Captured by bundle.sh under INCLUDE_CLAUDE_STATE=1.
+PACK_CLAUDE_STATE_SCOPE: tuple[str, ...] = (
+    ".claude/projects",      # per-project conversation history
+    ".claude/session-data",  # daily session-continuity files
+    ".claude/sessions",      # session summary maps
+    ".claude/todos",
+    ".claude/tasks",
+    ".claude/plans",
+    ".claude/history.jsonl",
+    ".claude/bash-commands.log",
+    ".claude/cost-tracker.log",
+    ".claude/file-history",  # arguably regenerable, but tied to past sessions
 )
 
 
@@ -218,8 +260,18 @@ def _classify_static(
     rel_path: str,
     chezmoi_set: set[str],
 ) -> tuple[str, str]:
-    """Return (bucket, rationale) for ``rel_path`` using static rules."""
-    if rel_path in chezmoi_set or any(rel_path.startswith(p + "/") for p in chezmoi_set):
+    """Return (bucket, rationale) for ``rel_path`` using static rules.
+
+    ``chezmoi managed`` is per-file granular AND lists directory entries.
+    A path is chezmoi-managed only if it appears in the set EXACTLY. Earlier
+    versions of this function also matched parent-prefix (the old logic
+    ``rel_path.startswith(p + "/")``); that incorrectly treated every child
+    of a chezmoi-tracked dir as covered, which masked chezmoi-IGNORED
+    children like ~/.claude/projects/ (773 MB of conversation history that
+    chezmoi explicitly excludes from a dotfiles repo). Defect 6 in the
+    migration log.
+    """
+    if rel_path in chezmoi_set:
         return ("chezmoi-managed", "tracked by chezmoi")
     if _matches(rel_path, PACK_PERSONAL_DEFAULTS):
         return ("pack-personal-default", "in pack-personal.sh defaults")
@@ -233,6 +285,11 @@ def _classify_static(
         return ("pack-creds-conditional", "covered by INCLUDE_CREDS=1")
     if _matches(rel_path, PACK_WALLETS_SCOPE):
         return ("pack-wallets-conditional", "covered by INCLUDE_WALLETS=1")
+    if _matches(rel_path, PACK_CLAUDE_STATE_SCOPE):
+        return (
+            "pack-claude-state-conditional",
+            "covered by INCLUDE_CLAUDE_STATE=1 — Claude Code session/conversation state",
+        )
     if _matches(rel_path, REGENERABLE_PATTERNS):
         return ("regenerable", "matches known regenerable pattern")
     return ("uncovered", "falls through every channel — needs decision")
