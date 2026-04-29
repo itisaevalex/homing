@@ -224,7 +224,13 @@ if [ -n "${EXTRA_PERSONAL_DIRS:-}" ]; then
   done
   if [ ${#EXTRA_PATHS[@]} -gt 0 ]; then
     echo "[2d] extras: tar (${EXTRA_PATHS[*]})..."
+    # --warning=no-file-{changed,removed,shrunk} suppresses tar's exit-1
+    # behavior on live-write races. Capturing live state (Claude conversation
+    # logs, browser dbs, etc.) means files mutate mid-tar — without these
+    # suppressors, set -euo pipefail aborts the whole bundle on a non-fatal
+    # warning. Real fatal errors (exit >= 2) still propagate.
     tar czf "$OUT/personal-extra.tar.gz" \
+        --warning=no-file-changed --warning=no-file-removed --warning=no-file-shrank \
         --exclude='node_modules' --exclude='.venv' --exclude='__pycache__' \
         --exclude='.cache' --exclude='target' --exclude='dist' \
         -C "$HOME" "${EXTRA_PATHS[@]}"
@@ -265,7 +271,11 @@ if [ "${INCLUDE_CLAUDE_STATE:-0}" = "1" ]; then
 
   if [ ${#CLAUDE_PATHS[@]} -gt 0 ]; then
     echo "[2e] claude-state: tar + age-encrypt (${#CLAUDE_PATHS[@]} paths)..."
-    ( umask 077 && tar czf "$CLAUDE_PLAIN" -C "$HOME" "${CLAUDE_PATHS[@]}" )
+    # See [2d] note — Claude conversation logs and history.jsonl are written
+    # live by any active Claude Code session. Suppress non-fatal tar warnings.
+    ( umask 077 && tar czf "$CLAUDE_PLAIN" \
+        --warning=no-file-changed --warning=no-file-removed --warning=no-file-shrank \
+        -C "$HOME" "${CLAUDE_PATHS[@]}" )
     if [ "${BUNDLE_KEY_MODE:-passphrase}" = "key" ]; then
       KEYFILE="$OUT/bundle.key"
       if [ ! -f "$KEYFILE" ]; then
