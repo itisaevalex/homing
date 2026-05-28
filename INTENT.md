@@ -45,6 +45,10 @@ These are explicitly out of scope. They are interesting, they will tempt scope-c
 
 `homing` makes the machine *legible*. The other tools act on the legibility.
 
+### Note on `attic` (sibling CLI in this repo)
+
+`attic` is one of those "other tools that act on the legibility" — for the cold-data case. It evicts stale + large + non-regenerable units to an encrypted object-storage remote, freeing local disk. It is **eviction, not backup**: a backup keeps the local copy as a safety net; `attic` *replaces* the local copy with a proof of recoverability (a verified remote round-trip + a tombstone breadcrumb). The "use restic" non-goal still holds — `attic` and `restic` solve different problems and compose cleanly.
+
 ## Validation: how we know it works
 
 Three tests, in order of importance:

@@ -18,6 +18,7 @@ This file is for: **someone cloned this repo and started you (the agent) in it b
 | `scripts/pack-personal.sh` | rsync personal-data folders (`~/Documents`, `~/Pictures`, etc.) with cache excludes. |
 | `src/homing/` | The `homing` CLI tool — enumerate, classify, draft, validate. |
 | `src/cabinet/` | The `cabinet` CLI tool — triage personal-document folders into archive/keep/review. |
+| `src/attic/` | The `attic` CLI tool — evict cold data to encrypted object storage (rclone + crypt). Eviction is gated on a real download → decrypt → re-hash round-trip recoverability proof. |
 | `config/platforms/` | Per-OS YAML config (Linux done, Windows/macOS to come). |
 | `skills/migrate/SKILL.md` | The migrate skill — installed by bootstrap into `~/.claude/skills/`. Has more detailed playbooks once you know which mode you're in. |
 | `CLAUDE.md` | Contributor doc — for when working on homing itself. |

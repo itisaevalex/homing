@@ -160,6 +160,39 @@ Always remind the user:
 - bundle passphrase (the age phrase used to encrypt `secrets.tar.gz.age`) — keep in your password manager, or split with the bundle USB on a second device
 - Tailscale auth key (from password manager)
 
+### A.5 — cold-data eviction (attic, optional)
+
+Use when the source machine is space-constrained OR the user has cold data they want preserved but not carried to the new machine (old project caches, finished experiments, AI-generated assets, archived datasets). `attic` evicts to encrypted object storage; the cloud copy becomes the source of truth.
+
+This is **eviction, not backup**: after the verified upload, local copies are deleted. Same trust model as cabinet's apply step.
+
+```bash
+cd "$HOMING"
+
+# Prereq: an rclone backing remote (S3/B2/R2/Azure/GCS) already configured.
+# If not, walk the user through it first — DON'T paste creds; create a scoped IAM
+# user / app key and put them in the appropriate per-tool config file.
+
+# 1. Scaffold the crypt remote and store the key fingerprint. Generates a strong
+#    crypt password and writes it to ~/.attic-crypt-password.txt with chmod 600.
+#    Stop and have the user copy it to their password manager NOW, then shred
+#    the file. Losing the password = permanent loss of the entire archive.
+attic init --remote-backend <backing-remote-name>
+
+# 2. Plan — score paths for archival.
+attic plan ~/Documents/cold-projects /path/to/old-renders \
+    --min-size 100000000 --min-age-days 90
+
+# 3. Push — upload + per-unit verified round-trip. Never deletes local.
+attic push --plan ~/attic/plans/plan-*.json --confirmed
+
+# 4. (Only after the user has confirmed the password is durably saved AND
+#    eyeballed the cloud copy) Evict — re-verify, then free local disk.
+attic evict --ledger ~/attic/ledgers/push-*.jsonl --confirmed
+```
+
+Per-unit verify uses temp space ≈ one unit's size in `$TMPDIR`. If `/tmp` is small relative to the largest unit, set `TMPDIR` to a different mount or split the plan. For pure backup (no eviction), `rclone sync` to the same crypt remote is simpler — `attic` is the right tool only when you intend to actually free the local disk.
+
 ---
 
 ## Mode B — arriving (destination machine)

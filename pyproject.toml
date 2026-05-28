@@ -52,6 +52,7 @@ dev = [
 [project.scripts]
 homing = "homing.cli:app"
 cabinet = "cabinet.cli:app"
+attic = "attic.cli:app"
 
 [project.urls]
 Homepage = "https://github.com/example/homing"
@@ -70,10 +71,14 @@ homing = ["py.typed"]
 minversion = "8.0"
 addopts = "-ra"
 testpaths = ["tests"]
+markers = [
+    "unit: fast, isolated unit tests (no external processes)",
+    "integration: tests that shell out to rclone or touch the real filesystem",
+]
 
 [tool.coverage.run]
 branch = true
-source = ["homing"]
+source = ["homing", "attic"]
 
 [tool.coverage.report]
 show_missing = true
