@@ -12,6 +12,7 @@ recoverability gate.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import stat as stat_mod
@@ -91,29 +92,33 @@ def _roundtrip_verify_dir(
 
 
 def _materialize_from_manifest(root: Path, manifest: list[dict]) -> None:
-    """Reconstitute symlinks + empty dirs from a manifest into ``root``.
+    """Reconstitute empty dirs from a manifest and restore file modes.
 
-    rclone ``--links`` writes a symlink ``foo`` as ``foo.rclonelink`` (a text
-    file containing the target). We turn those back into real symlinks. Empty
-    dirs (dropped by object stores) are recreated. File modes are restored.
+    Symlinks are intentionally NOT touched here. ``rclone copy --links`` is
+    symmetric: it converts symlinks to ``.rclonelink`` files on upload AND
+    converts ``.rclonelink`` files back to real symlinks on download. By the
+    time we run, rclone has already created the symlink from the remote
+    bytes — we leave it in place so ``_assert_manifest_matches`` can verify
+    the reconstructed target against the manifest (a real round-trip check
+    of the remote content). Reconstructing from the manifest would make the
+    verify circular and silently accept a corrupted or missing ``.rclonelink``
+    upload.
+
+    Empty dirs are dropped by object stores, so they're recreated from the
+    manifest. File modes are restored (rclone preserves content but not
+    necessarily mode bits on every backend).
     """
     for entry in manifest:
         rel = entry["rel"]
         etype = entry["type"]
         target_path = root / rel
-        if etype == "symlink":
-            rclonelink = root / f"{rel}.rclonelink"
-            if rclonelink.exists():
-                rclonelink.unlink()
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            if os.path.lexists(target_path):
-                target_path.unlink()
-            os.symlink(entry["target"], target_path)
-        elif etype == "emptydir":
+        if etype == "emptydir":
             target_path.mkdir(parents=True, exist_ok=True)
             _chmod_quiet(target_path, entry.get("mode"))
         elif etype == "file":
             _chmod_quiet(target_path, entry.get("mode"))
+        # symlink: rclone --links has already reconstructed it from the remote
+        # .rclonelink. _assert_manifest_matches then verifies its target.
 
 
 def _assert_manifest_matches(root: Path, manifest: list[dict]) -> None:
@@ -495,10 +500,19 @@ def _evict_one(
         )
 
     ts = int(time.time())
-    tombstone_path = _plat.tombstones_dir(system_dir) / f"{_safe_name(entry.unit_id)}-{ts}.json"
+    # Hash suffix prevents tombstone/staging name collision when two unit_ids
+    # differ only in characters that _safe_name folds to "_" (e.g. spaces).
+    unit_hash = hashlib.sha256(entry.unit_id.encode("utf-8")).hexdigest()[:8]
+    tombstone_path = (
+        _plat.tombstones_dir(system_dir)
+        / f"{_safe_name(entry.unit_id)}-{unit_hash}-{ts}.json"
+    )
 
     if entry.is_dir:
-        staging = _plat.staging_dir(system_dir) / f"{_safe_name(entry.unit_id)}-{ts}"
+        staging = (
+            _plat.staging_dir(system_dir)
+            / f"{_safe_name(entry.unit_id)}-{unit_hash}-{ts}"
+        )
         _stage_dir(source, staging)
         _ledger.append(
             ledger_path, _status_entry(entry, "evict", "staged", config, staging_path=str(staging))
@@ -540,11 +554,16 @@ def _stage_dir(source: Path, staging: Path) -> None:
         os.rename(source, staging)
         return
     # Cross-FS: copy → verify dir-tree hash → remove source (cabinet pattern).
+    # Wrap the verify+remove in try/finally so a hash-time exception (e.g. a
+    # file under source vanishing mid-walk) doesn't leak the staging copy.
     shutil.copytree(source, staging, symlinks=True)
-    if _ledger._hash_dir_tree(source) != _ledger._hash_dir_tree(staging):
+    try:
+        if _ledger._hash_dir_tree(source) != _ledger._hash_dir_tree(staging):
+            raise EvictionRefused(f"cross-FS staging verify failed: {source}")
+        shutil.rmtree(source)
+    except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
-        raise EvictionRefused(f"cross-FS staging verify failed: {source}")
-    shutil.rmtree(source)
+        raise
 
 
 def _same_filesystem(a: Path, b: Path) -> bool:
@@ -588,7 +607,10 @@ def _write_tombstone(path: Path, entry: LedgerEntry, config: AtticConfig) -> Non
         "evicted_at": time.time(),
     }
     text = json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=False)
-    with path.open("wb") as fh:
+    # Exclusive create — refuses to overwrite an existing tombstone. With the
+    # unit-hash suffix collisions are astronomically unlikely; xb is defense-
+    # in-depth so a stale tombstone is never silently clobbered.
+    with path.open("xb") as fh:
         fh.write(text.encode("utf-8"))
         fh.flush()
         try:

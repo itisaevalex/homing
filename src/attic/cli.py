@@ -137,6 +137,7 @@ def _obscure(password: str) -> str:
         ["rclone", "obscure", password], capture_output=True, text=True, check=False
     )
     if proc.returncode != 0:
+        typer.echo(f"rclone obscure failed: {proc.stderr.strip()}", err=True)
         raise typer.Exit(code=2)
     return proc.stdout.strip()
 
